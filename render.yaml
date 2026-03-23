@@ -1,13 +1,10 @@
 services:
   - type: web
     name: text-to-sql
-    runtime: python
+    runtime: docker
     plan: free
-    buildCommand: chmod +x build.sh && ./build.sh
-    startCommand: gunicorn app.main:app -w 2 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT --timeout 300
+    dockerfilePath: ./Dockerfile
     envVars:
-      - key: PYTHON_VERSION
-        value: "3.11.6"
       - key: GEMINI_API_KEY_1
         sync: false
       - key: QDRANT_URL

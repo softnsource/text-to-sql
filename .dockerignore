@@ -1,0 +1,11 @@
+.git
+__pycache__
+*.pyc
+.env
+venv/
+.venv
+uploads/session_store/
+uploads/cache/
+frontend/node_modules
+frontend/dist
+.claude/
