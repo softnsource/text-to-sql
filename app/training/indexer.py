@@ -24,13 +24,13 @@ def build_db_hash(db_key: str) -> str:
 class Indexer:
     def __init__(self):
         self.settings = get_settings()
-        # q = self.settings.qdrant
+        q = self.settings.qdrant
 
-        # Connect to Qdrant server
+        # Connect to Qdrant server using env-based config
         self.client = QdrantClient(
-            url="https://1e3848ab-b68d-441c-beda-d086923df770.us-east4-0.gcp.cloud.qdrant.io",
-            api_key="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3MiOiJtIn0.rXXjSwuYvpQ_xagT0PI-wRCieyldSWBI5yIcM4SMRI4",
-            prefer_grpc=False,  # Use REST, compatible with your setup
+            url=q.url,
+            api_key=q.api_key,
+            prefer_grpc=False,
         )
 
     # --------------------------------------------------------

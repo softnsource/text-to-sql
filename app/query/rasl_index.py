@@ -25,8 +25,8 @@ class EntityChunk:
 def _qdrant_client() -> QdrantClient:
     s = get_settings()
     return QdrantClient(
-        url="https://1e3848ab-b68d-441c-beda-d086923df770.us-east4-0.gcp.cloud.qdrant.io",
-        api_key="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3MiOiJtIn0.rXXjSwuYvpQ_xagT0PI-wRCieyldSWBI5yIcM4SMRI4",
+        url=s.qdrant.url,
+        api_key=s.qdrant.api_key,
         prefer_grpc=False,
     )
 

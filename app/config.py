@@ -411,7 +411,7 @@ def _load_config() -> Settings:
         ),
         qdrant=QdrantConfig(
             url=q['url'],
-            api_key=q.get('api_key') or None,
+            api_key=q.get('api_key') or os.getenv('QDRANT_API_KEY'),
             collection_prefix=q['collection_prefix'],
             timeout=q.get('timeout', 30),
             verify_ssl=q.get('verify_ssl', True),

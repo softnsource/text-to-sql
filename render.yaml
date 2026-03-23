@@ -12,5 +12,7 @@ services:
         sync: false
       - key: QDRANT_URL
         sync: false
+      - key: QDRANT_API_KEY
+        sync: false
       - key: APP_DATABASE_URL
         sync: false
