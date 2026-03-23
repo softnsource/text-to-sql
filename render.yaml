@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: text-to-sql
+    runtime: python
+    plan: free
+    buildCommand: chmod +x build.sh && ./build.sh
+    startCommand: gunicorn app.main:app -w 2 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT --timeout 300
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.6"
+      - key: GEMINI_API_KEY_1
+        sync: false
+      - key: QDRANT_URL
+        sync: false
+      - key: APP_DATABASE_URL
+        sync: false

@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//c/Users/DELL/AppData/Local/Programs/Python/Python312/**)",
+      "Bash(\"/c/Users/DELL/AppData/Local/Programs/Python/Python312/Scripts/uvicorn.exe\" --version)",
+      "Read(//c/Users/DELL/AppData/Local/Programs/Python//**)"
+    ]
+  }
+}
