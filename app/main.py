@@ -1651,8 +1651,8 @@ async def chronoplot_chat_query(request: Request, body: ChronoChatRequest, _toke
             safe_sql = val_result.sql
 
             # Apply mandatory filters for non-owners (Managers and SiteAdmins)
-            logger.info(f"Chronoplot Filter : {getattr(ctx, 'common_filter_keys', None)}")
-            if not effective_is_owner and getattr(ctx, "common_filter_keys", None):
+            logger.info(f"Chronoplot Filter : {getattr(ctx, 'common_filter_keys', None)} Is super admin : {is_super_admin}")
+            if not is_super_admin and getattr(ctx, "common_filter_keys", None):
                 try:
                     from app.query.filter_verifier import SQLFilterVerifier
                     verifier = SQLFilterVerifier(dialect=ctx.dialect)
