@@ -188,6 +188,7 @@ class SavedModel(Base):
     connection_string = Column(String(1024), nullable=False)
     db_key = Column(String(255), nullable=False)
     qdrant_collection = Column(String(255), nullable=False)
+    common_filter_keys = Column(JSON, nullable=True)  # List of mandatory filter column names
     created_at = Column(DateTime, default=func.now(), nullable=False)
     
     user = relationship("User", back_populates="models")

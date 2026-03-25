@@ -17,7 +17,10 @@ def save_session(ctx: SessionContext):
         "qdrant_collection": ctx.qdrant_collection,
         "training_complete": ctx.training_complete,
         "connection_string": ctx.connection_string,
-        "user_descriptions": getattr(ctx, 'user_descriptions', {})
+        "user_descriptions": getattr(ctx, 'user_descriptions', {}),
+        "common_filter_keys": getattr(ctx, 'common_filter_keys', []),
+        "session_filter_values": getattr(ctx, 'session_filter_values', {}),
+        "is_owner": getattr(ctx, 'is_owner', False)
     }
     path.write_text(json.dumps(data), encoding="utf-8")
 

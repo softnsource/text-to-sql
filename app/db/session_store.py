@@ -26,6 +26,9 @@ class SessionContext:
     last_used: float = field(default_factory=time.time)
     training_complete: bool = False
     connection_string: Optional[str] = None
+    common_filter_keys: List[str] = field(default_factory=list)
+    session_filter_values: Dict[str, Any] = field(default_factory=dict)
+    is_owner: bool = False
 
 
 class SessionStore:

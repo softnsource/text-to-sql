@@ -18,13 +18,14 @@ const INDEX_MESSAGES = [
 ];
 
 function Training({ sessionInfo, onComplete, onError }) {
-  const [phase, setPhase] = useState('extracting'); // extracting, desc_input, final_training
+  const [phase, setPhase] = useState('extracting'); // extracting, desc_input, filter_keys, final_training
   const [progress, setProgress] = useState(0);
   const [statusText, setStatusText] = useState("Analyzing your database structure...");
   const [stepsDone, setStepsDone] = useState([]);
   const [schemaReport, setSchemaReport] = useState([]);
   const [customDescs, setCustomDescs] = useState({});
   const [randomMsgIndex, setRandomMsgIndex] = useState(0);
+  const [filterKeys, setFilterKeys] = useState(['']); // For mandatory filters
 
   useEffect(() => {
     if (phase === 'extracting' || phase === 'final_training') {
@@ -59,7 +60,7 @@ function Training({ sessionInfo, onComplete, onError }) {
             fetchSchemaReport();
           } else if (data.step === "ready") {
             source.close();
-            onComplete();
+            onComplete(filterKeys.filter(k => k.trim() !== ''));
           } else if (data.step === "error") {
             source.close();
             onError(data.error);
@@ -95,9 +96,31 @@ function Training({ sessionInfo, onComplete, onError }) {
 
   const handleDescSubmit = async (e) => {
     e?.preventDefault();
-    setPhase('final_training');
+    setPhase('filter_keys');
     setStepsDone(prev => [...prev, 'user_descriptions']);
+  };
 
+  const handleFilterKeysSubmit = async (e) => {
+    e?.preventDefault();
+    const cleanKeys = filterKeys.filter(k => k.trim() !== '');
+    
+    try {
+      // Save keys to session context in backend
+      const resp = await fetch(`/api/session/${sessionInfo.sessionId}/filter-keys`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: sessionInfo.sessionId, keys: cleanKeys })
+      });
+      if (!resp.ok) throw new Error("Failed to save mandatory filters");
+
+      setPhase('final_training');
+      startFinalTraining();
+    } catch (err) {
+      onError(err.message);
+    }
+  };
+
+  const startFinalTraining = async () => {
     try {
       const payload = {
         session_id: sessionInfo.sessionId,
@@ -143,7 +166,7 @@ function Training({ sessionInfo, onComplete, onError }) {
                   setStepsDone(prev => [...prev, data.step]);
                 }
                 if (data.step === "ready") {
-                  onComplete();
+                  onComplete(filterKeys.filter(k => k.trim() !== ''));
                   return;
                 } else if (data.step === "error") {
                   onError(data.error);
@@ -159,6 +182,20 @@ function Training({ sessionInfo, onComplete, onError }) {
       }
     } catch (err) {
       onError(err.message);
+    }
+  };
+
+  const addFilterKeyField = () => setFilterKeys([...filterKeys, '']);
+  const updateFilterKey = (index, value) => {
+    const newKeys = [...filterKeys];
+    newKeys[index] = value;
+    setFilterKeys(newKeys);
+  };
+  const removeFilterKey = (index) => {
+    if (filterKeys.length > 1) {
+      setFilterKeys(filterKeys.filter((_, i) => i !== index));
+    } else {
+      setFilterKeys(['']);
     }
   };
 
@@ -190,7 +227,54 @@ function Training({ sessionInfo, onComplete, onError }) {
           </div>
           <div className="desc-actions">
             <button type="button" className="secondary" onClick={() => handleDescSubmit()}>Skip - Use AI Only</button>
-            <button type="submit">Submit & Index →</button>
+            <button type="submit">Next: Set Unique Keys →</button>
+          </div>
+        </form>
+      </div>
+    );
+  }
+
+  if (phase === 'filter_keys') {
+    return (
+      <div className="training-panel glass-panel animate-fade-in" style={{ maxWidth: '600px' }}>
+        <div className="header-text">
+          <h1>Set Mandatory Filter Keys <span style={{ fontSize: '0.6em', opacity: 0.6 }}>(Unique Keys)</span></h1>
+          <p className="text-muted">Specify column names that MUST be filtered in every query (e.g. user_id, org_id).</p>
+        </div>
+
+        <form onSubmit={handleFilterKeysSubmit}>
+          <div className="filter-keys-container" style={{ marginBottom: '20px' }}>
+            {filterKeys.map((key, idx) => (
+              <div key={idx} style={{ display: 'flex', gap: '10px', marginBottom: '10px', alignItems: 'center' }}>
+                <input
+                  type="text"
+                  placeholder="Exact Column Name (e.g. user_id)"
+                  value={key}
+                  onChange={(e) => updateFilterKey(idx, e.target.value)}
+                  style={{ flex: 1 }}
+                />
+                <button 
+                  type="button" 
+                  className="secondary" 
+                  onClick={() => removeFilterKey(idx)}
+                  style={{ padding: '8px 12px', minWidth: 'auto' }}
+                >
+                  ✕
+                </button>
+              </div>
+            ))}
+            <button 
+              type="button" 
+              className="secondary" 
+              onClick={addFilterKeyField}
+              style={{ width: '100%', border: '1px dashed var(--border-color)', background: 'transparent' }}
+            >
+              + Add Another Field
+            </button>
+          </div>
+          <div className="desc-actions">
+            <button type="button" className="secondary" onClick={() => handleFilterKeysSubmit()}>Skip - No Restrictions</button>
+            <button type="submit">Complete Training →</button>
           </div>
         </form>
       </div>

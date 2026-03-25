@@ -216,7 +216,7 @@ from typing import Any, Dict, List, Optional
 
 import yaml
 from dotenv import load_dotenv
-
+load_dotenv()
 
 @dataclass
 class GeminiConfig:

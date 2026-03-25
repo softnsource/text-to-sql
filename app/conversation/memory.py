@@ -25,7 +25,7 @@ class ConversationTurn:
 class ConversationMemory:
     """In-memory conversation history manager, limited to last N turns."""
 
-    def __init__(self, max_turns: int = 5):
+    def __init__(self, max_turns: int = 4):
         """Initialize conversation memory with a maximum turn limit.
 
         Args:
@@ -102,7 +102,7 @@ def _cleanup_expired_sessions() -> None:
         logger.debug(f"Cleaned up {len(expired)} expired sessions")
 
 
-def get_session_memory(session_id: str, max_turns: int = 5) -> ConversationMemory:
+def get_session_memory(session_id: str, max_turns: int = 4) -> ConversationMemory:
     """Get or create a conversation memory for a session.
 
     Args:
