@@ -12,7 +12,7 @@ qdrant:
   collection_prefix: "session_"
   timeout: 300         # HTTP timeout in seconds for all Qdrant requests
   verify_ssl: true       # Set false if your Qdrant server uses a self-signed cert
-  api_key: ${QDRNT_API_KEY}
+  api_key: ${QDRANT_API_KEY}
 
 query:
   max_rows_per_query: 1000
