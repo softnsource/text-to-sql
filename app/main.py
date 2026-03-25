@@ -1603,6 +1603,7 @@ async def chronoplot_chat_query(request: Request, body: ChronoChatRequest, _toke
     eng = connector.from_connection_string(ctx.connection_string)
 
     # Fallback: if session has no filter keys, try to fetch from SavedModel table by db_key
+    logger.info(f"[chronoplot] Checking for common_filter_keys in session context: {getattr(ctx, 'common_filter_keys', None)}, db_key: {getattr(ctx, 'db_key', None)}")
     if not getattr(ctx, "common_filter_keys", None) and getattr(ctx, "db_key", None):
         db_s = AppDBSession()
         try:
