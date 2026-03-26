@@ -1492,7 +1492,7 @@ async def chronoplot_connect(
 
 @app.get("/api/chronoplot/train/{session_id}")
 async def chronoplot_train(session_id: str):
-    """Stream training progress for chronoplot via Server-Sent Events."""
+    """Train chronoplot and return result directly."""
     ctx = await get_session_store().get(session_id)
     if not ctx:
         persisted = load_session(session_id)
@@ -1502,25 +1502,27 @@ async def chronoplot_train(session_id: str):
 
     pipeline = TrainingPipeline()
 
-    async def event_stream():
-        yield ": keepalive\n\n"
-        try:
-            cached_data = pipeline._load_schema_cache(ctx.db_key) if ctx.db_key else None
-            if cached_data is not None:
-                tables, _ = cached_data
-            else:
-                tables = await pipeline.extract_only(session_id, ctx.engine)
-            ctx.tables = tables
-            await get_session_store().register(ctx)
-            yield f'data: {json.dumps({"step": "tables_ready", "progress": 100, "tables_done": len(tables), "tables_total": len(tables), "message": "Tables extracted. Please provide descriptions.", "error": ""})}\n\n'
-        except Exception as exc:
-            yield f'data: {json.dumps({"step": "error", "message": str(exc)})}\n\n'
+    try:
+        cached_data = pipeline._load_schema_cache(ctx.db_key) if ctx.db_key else None
+        if cached_data is not None:
+            tables, _ = cached_data
+        else:
+            tables = await pipeline.extract_only(session_id, ctx.engine)
 
-    return StreamingResponse(
-        event_stream(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
+        ctx.tables = tables
+        await get_session_store().register(ctx)
+
+        return {
+            "step": "tables_ready",
+            "progress": 100,
+            "tables_done": len(tables),
+            "tables_total": len(tables),
+            "message": "Tables extracted. Please provide descriptions.",
+            "error": ""
+        }
+
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.get("/api/chronoplot/tables/{session_id}")
@@ -1541,7 +1543,7 @@ async def chronoplot_get_tables(session_id: str):
 
 @app.post("/api/chronoplot/train-with-input")
 async def chronoplot_train_with_input(body: ChronoTrainRequest):
-    """Run chronoplot training with user-provided table descriptions (SSE)."""
+    """Run chronoplot training with user-provided table descriptions."""
     ctx = await get_session_store().get(body.session_id)
     if not ctx:
         raise HTTPException(404, "Session not found")
@@ -1551,7 +1553,8 @@ async def chronoplot_train_with_input(body: ChronoTrainRequest):
     user_desc_map = {t.table_name: t.user_description for t in body.tables if t.user_description}
     pipeline = TrainingPipeline()
 
-    async def event_stream():
+    try:
+        last_progress = None
         async for progress in pipeline.run_with_user_input(
             session_id=body.session_id,
             tables=ctx.tables,
@@ -1560,9 +1563,12 @@ async def chronoplot_train_with_input(body: ChronoTrainRequest):
             qdrant_collection=ctx.qdrant_collection,
             db_key=ctx.db_key,
         ):
-            yield f"data: {json.dumps(progress.__dict__)}\n\n"
+            last_progress = progress
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+        return last_progress.__dict__ if last_progress else {"message": "Training complete"}
+
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
