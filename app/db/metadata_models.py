@@ -242,9 +242,16 @@ if not APP_DATABASE_URL:
 def init_app_db():
     assert APP_DATABASE_URL is not None, "APP_DATABASE_URL environment variable is not set."
     engine_args = {}
-    if "sqlite" in APP_DATABASE_URL:   # ✓ Pylance now knows it's str
+    db_url = APP_DATABASE_URL
+    
+    # Ensure PostgreSQL URLs have the explicit psycopg2 dialect for SQLAlchemy 2.0
+    if db_url.startswith("postgresql://") and "psycopg" not in db_url:
+        db_url = db_url.replace("postgresql://", "postgresql+psycopg2://")
+    
+    if "sqlite" in db_url:
         engine_args = {"connect_args": {"check_same_thread": False}}
-    engine = create_engine(APP_DATABASE_URL, **engine_args)
+    
+    engine = create_engine(db_url, **engine_args)
     Base.metadata.create_all(engine)
     return sessionmaker(bind=engine, expire_on_commit=False)
 
