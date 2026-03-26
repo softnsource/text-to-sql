@@ -243,14 +243,16 @@ def init_app_db():
     assert APP_DATABASE_URL is not None, "APP_DATABASE_URL environment variable is not set."
     engine_args = {}
     db_url = APP_DATABASE_URL
-    
-    # Ensure PostgreSQL URLs have the explicit psycopg2 dialect for SQLAlchemy 2.0
-    if db_url.startswith("postgresql://") and "psycopg" not in db_url:
-        db_url = db_url.replace("postgresql://", "postgresql+psycopg2://")
-    
+
+    # Ensure PostgreSQL URLs have the explicit psycopg dialect for SQLAlchemy 2.0
+    if db_url.startswith("postgres://") and "psycopg" not in db_url:
+        db_url = db_url.replace("postgres://", "postgresql+psycopg://")
+    elif db_url.startswith("postgresql://") and "psycopg" not in db_url:
+        db_url = db_url.replace("postgresql://", "postgresql+psycopg://")
+
     if "sqlite" in db_url:
         engine_args = {"connect_args": {"check_same_thread": False}}
-    
+
     engine = create_engine(db_url, **engine_args)
     Base.metadata.create_all(engine)
     return sessionmaker(bind=engine, expire_on_commit=False)
