@@ -125,12 +125,17 @@ def init_db(connection_string: str) -> None:
     """Initialize the metadata database and create all tables."""
     global _session_factory
 
+    pg_connect_args = {}
+    if "postgresql" in connection_string or "postgres" in connection_string:
+        pg_connect_args["prepare_threshold"] = 0  # Disable psycopg3 prepared statement cache
+
     engine = create_engine(
         connection_string,
         pool_pre_ping=True,
         pool_size=5,
         max_overflow=10,
-        echo=False
+        echo=False,
+        connect_args=pg_connect_args
     )
 
     # Create all tables
@@ -252,6 +257,8 @@ def init_app_db():
 
     if "sqlite" in db_url:
         engine_args = {"connect_args": {"check_same_thread": False}}
+    elif "postgresql" in db_url or "postgres" in db_url:
+        engine_args = {"connect_args": {"prepare_threshold": 0}}  # Disable psycopg3 prepared statement cache
 
     engine = create_engine(db_url, **engine_args)
     Base.metadata.create_all(engine)

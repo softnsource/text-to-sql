@@ -1433,6 +1433,12 @@ class ChronoCreateThreadRequest(BaseModel):
     db_session_id: str
     title: str
 
+class ChronoSaveModelRequest(BaseModel):
+    session_id: str
+    name: str
+
+class ChronoUpdateModelMetadataRequest(BaseModel):
+    common_filter_keys: List[str]
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  CHRONOPLOT — Train endpoints  (no auth required)
@@ -1840,3 +1846,149 @@ def chronoplot_get_thread_messages(thread_id: int, request: Request, _token: Any
         ]
     finally:
         db.close()
+
+
+@app.get("/api/chronoplot/models")
+async def chronoplot_list_models(
+    request: Request,
+    _token: Any = Depends(cp_bearer),
+):
+    """List all saved Chronoplot models with owner info."""
+    user_detail_id, user_type, jwt_payload = _cp_authorize(request)
+    is_super_admin = (user_type == int(UserType.SuperAdmin))
+
+    db = AppDBSession()
+    try:
+        models = (
+            db.query(SavedModel, User.username)
+            .join(User, SavedModel.user_id == User.id)
+            .all()
+        )
+        return [
+            {
+                "id": m.SavedModel.id,
+                "name": m.SavedModel.name,
+                "dialect": m.SavedModel.dialect,
+                "db_name": m.SavedModel.db_name,
+                "common_filter_keys": m.SavedModel.common_filter_keys or [],
+                "created_at": m.SavedModel.created_at,
+                "is_owner": (m.username == str(user_detail_id)) or is_super_admin,
+                "owner_name": m.username,
+            }
+            for m in models
+        ]
+    finally:
+        db.close()
+
+
+@app.post("/api/chronoplot/models/save")
+async def chronoplot_save_model(
+    request: Request,
+    body: ChronoSaveModelRequest,
+    _token: Any = Depends(cp_bearer),
+):
+    user_detail_id, user_type, jwt_payload = _cp_authorize(request)
+
+    ctx = await get_session_store().get(body.session_id)
+    if not ctx:
+        ctx_data = load_session(body.session_id)
+        if not ctx_data:
+            raise HTTPException(status_code=404, detail="Session not found or expired.")
+        ctx = _cp_rebuild_ctx(ctx_data)
+
+    db = AppDBSession()
+    try:
+        # Reuse the same upsert pattern as chronoplot_create_thread
+        # user_detail_id is stored as username — row likely already exists from chat
+        user = db.query(User).filter(User.username == str(user_detail_id)).first()
+        if not user:
+            user = User(
+                username=str(user_detail_id),
+                password_hash=hash_password(uuid.uuid4().hex),
+            )
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+
+        model = SavedModel(
+            user_id=user.id,
+            name=body.name,
+            dialect=ctx.dialect,
+            db_name=ctx.db_name,
+            connection_string=ctx.connection_string or "",
+            db_key=ctx.db_key,
+            qdrant_collection=ctx.qdrant_collection,
+            common_filter_keys=getattr(ctx, "common_filter_keys", []),
+        )
+        db.add(model)
+        db.commit()
+        db.refresh(model)
+        return {"message": "Model saved successfully", "id": model.id}
+    finally:
+        db.close()
+
+
+@app.post("/api/chronoplot/models/{model_id}/load")
+async def chronoplot_load_model(
+    model_id: int,
+    request: Request,
+    _token: Any = Depends(cp_bearer),
+):
+    user_detail_id, user_type, jwt_payload = _cp_authorize(request)
+
+    db = AppDBSession()
+    try:
+        # Any authenticated chronoplot user can load any model
+        result = (
+            db.query(SavedModel, User.username)
+            .join(User, SavedModel.user_id == User.id)
+            .filter(SavedModel.id == model_id)
+            .first()
+        )
+        if not result:
+            raise HTTPException(status_code=404, detail="Model not found.")
+
+        model, owner_username = result.SavedModel, result.username
+    finally:
+        db.close()
+
+    session_id = str(uuid.uuid4())
+
+    try:
+        engine = (
+            connector.from_connection_string(model.connection_string)
+            if model.connection_string
+            else None
+        )
+    except Exception:
+        engine = None
+
+    # SuperAdmin bypasses filters regardless of ownership
+    is_super_admin = (user_type == int(UserType.SuperAdmin))
+    effective_is_owner = (owner_username == str(user_detail_id)) or is_super_admin
+
+    ctx = SessionContext(
+        session_id=session_id,
+        engine=engine,
+        dialect=model.dialect,
+        db_name=model.db_name,
+        source_type="connection_string" if model.connection_string else "upload",
+        table_count=0,
+        qdrant_collection=model.qdrant_collection,
+        db_key=model.db_key,
+        connection_string=model.connection_string,
+        common_filter_keys=model.common_filter_keys or [],
+        is_owner=effective_is_owner,
+    )
+    await get_session_store().register(ctx)
+    save_session(ctx)
+
+    logger.info(
+        f"[chronoplot] Model {model_id} loaded by user_detail_id={user_detail_id} "
+        f"(is_owner={effective_is_owner}, session={session_id})"
+    )
+    return {
+        "session_id": session_id,
+        "is_owner": effective_is_owner,
+        "message": "Model loaded successfully",
+    }
