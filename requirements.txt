@@ -20,3 +20,4 @@ python-multipart
 gunicorn
 qdrant_client
 python-jose
+psycopg[binary]
