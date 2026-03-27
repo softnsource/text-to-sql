@@ -24,17 +24,6 @@ class GenerationResult:
 
 import re
 
-BOOLEAN_TRUE_PATTERN = [
-    "1", "'1'", "'true'", "'True'", "'TRUE'",
-    "'yes'", "'Yes'", "'YES'", "'y'", "'Y'"
-]
-
-BOOLEAN_FALSE_PATTERN = [
-    "0", "'0'","'false'", "'False'", "'FALSE'",
-    "'no'", "'No'", "'NO'", "'n'", "'N'"
-]
-
-
 def expand_boolean_conditions(sql: str) -> str:
     def replacer(match):
         column = match.group(1)
@@ -183,6 +172,24 @@ class SQLGenerator:
 
             Only use column names that appear verbatim (case-insensitive) in the provided DATABASE SCHEMA.
 
+            =====================
+            BOOLEAN COLUMN RULE (CRITICAL - Add this)
+            =====================
+            
+            Some columns are BOOLEAN / BIT type (e.g. IsSafeguardRaised, CQCNotificationDone, 
+            InvestigationStarted, InvestigationCompleted, etc.).
+            
+            For BOOLEAN columns:
+            - NEVER use LIKE '%value%'
+            - ALWAYS use = 1 or = 0  (or the expanded version)
+            - Look at the datatype in the SCHEMA. If it says BIT, BOOLEAN, or the column name 
+              starts with "Is", "Has", "CQCNotification", treat it as boolean.
+            - Do NOT apply the STRING FILTER RULE to boolean columns.
+            
+            Example of GOOD boolean filter:
+            WHERE t1.CQCNotificationDone = 1
+            
+            BAD: WHERE t1.CQCNotificationDone LIKE '%True%'
             =====================
             COLUMN SELECTION RULE (CRITICAL)
             =====================
