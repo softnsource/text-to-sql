@@ -867,6 +867,37 @@ Do NOT mention "SQL", "database errors", "max retries", "internal error", or any
         fallback = "I hit a snag trying to pull that data right now. Could you try rephrasing your question or asking in a different way?"
         return await self._gemini_call(prompt, fallback=fallback)
 
+    async def _humanize_permission_error(self, question: str) -> str:
+        """Generate a friendly response when user doesn't have access to the data."""
+        
+        prompt = f"""{CHAT_SYSTEM_PROMPT}
+
+            The user asked: "{question}"
+
+            The system could not return results because the user does not have permission to access this data.
+
+            Write 1-2 short, friendly sentences explaining that the data can't be shown due to access restrictions. 
+            Suggest they try a different request or contact the admin if needed. 
+            Sound polite, helpful, and natural — NOT technical.
+
+            DO NOT mention:
+            - SQL
+            - filters
+            - permissions logic
+            - security rules
+            - internal systems
+            - errors
+
+            Keep it simple and user-friendly.
+        """
+
+        fallback = (
+            "I’m not able to show that information right now due to access restrictions. "
+            "You can try a different request, or reach out to your admin if you think you should have access."
+        )
+
+        return await self._gemini_call(prompt, fallback=fallback)
+
     async def _humanize_rows(self, question: str, rows: List[Dict], columns: List[str]) -> str:
         rows_text = "\n".join(
             ", ".join(f"{k}: {v}" for k, v in row.items()) for row in rows

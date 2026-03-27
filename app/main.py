@@ -1052,9 +1052,10 @@ async def chat_query(request: Request, body: ChatRequest):
                     )
                     logger.info(f"Filtered SQL applied: {safe_sql}")
                 except PermissionError as e:
+                    permission_error_text = await formatter._humanize_permission_error(question)
                     return ChatResponse(
                         mode="empty",
-                        text_summary=str(e),
+                        text_summary=permission_error_text,
                         sql_used=val_result.sql,
                     )
                 except Exception as e:
@@ -1711,9 +1712,9 @@ async def chronoplot_chat_query(request: Request, body: ChronoChatRequest, _toke
                 conversation_context=conversation_context,
             )
             if plan.needs_clarification and not plan.relevant_tables:
-                text = "\n".join(plan.clarification_questions)
-                save_message(body.thread_id, "assistant", text)
-                return ChronoChatResponse(mode="empty", text_summary="\n".join(plan.clarification_questions))
+                no_data_text = await formatter._humanize_no_data(question)
+                save_message(body.thread_id, "assistant", no_data_text)
+                return ChronoChatResponse(mode="empty", text_summary=no_data_text, page=1, pages_total=1)
 
             gen_result = await generator.generate(plan, conversation_context, ctx.qdrant_collection)
             if gen_result.chat_response and not gen_result.sql:
@@ -1838,10 +1839,10 @@ async def chronoplot_chat_query(request: Request, body: ChronoChatRequest, _toke
         no_data_text = await formatter._humanize_no_data(question)
         save_message(body.thread_id, "assistant", no_data_text)
         return ChronoChatResponse(mode="no_data", text_summary=no_data_text, page=1, pages_total=1)
-
+    no_data_text = await formatter._humanize_no_data(question)
     return ChronoChatResponse(
         mode="empty",
-        text_summary=f"I wasn't able to answer after {max_retries} attempts. Last error: {last_error}.",
+        text_summary=no_data_text,
     )
 
 
