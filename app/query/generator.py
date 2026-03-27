@@ -176,7 +176,7 @@ class SQLGenerator:
             =====================
             For select column use all tables columns you can use join tables columns also if available
             You must carefully choose which columns to include in the SELECT clause.
-            
+            9. DO NOT use STRFTIME, DATE_FORMAT, or TO_CHAR if Dialect is Mssqlserver.
             RULES:
             
             1. ONLY select columns that are directly relevant to the user's question.

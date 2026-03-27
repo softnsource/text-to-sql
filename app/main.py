@@ -1546,7 +1546,11 @@ async def chronoplot_get_tables(session_id: str):
     """Return extracted tables for a chronoplot session (before training)."""
     ctx = await get_session_store().get(session_id)
     if not ctx:
-        raise HTTPException(404, "Session not found")
+        persisted = load_session(session_id)
+        if not persisted:
+            raise HTTPException(404, "Session not found or expired.")
+        ctx = _cp_rebuild_ctx(persisted)
+        await get_session_store().register(ctx)   # put back in memory for next call
     pipeline = TrainingPipeline()
     tables = await pipeline.extract_only(session_id, ctx.engine)
     ctx.tables = tables
@@ -1560,11 +1564,35 @@ async def chronoplot_get_tables(session_id: str):
 @app.post("/api/chronoplot/train-with-input")
 async def chronoplot_train_with_input(body: ChronoTrainRequest):
     """Run chronoplot training with user-provided table descriptions."""
+    logger.info(f"Received training input for session {body.session_id} with {len(body.tables)} table descriptions.")
     ctx = await get_session_store().get(body.session_id)
     if not ctx:
-        raise HTTPException(404, "Session not found")
-    if not hasattr(ctx, "tables"):
-        raise HTTPException(400, "Tables not loaded. Call /tables first.")
+        # Fallback: session may have been evicted from memory (e.g. server restart, LRU eviction)
+        persisted = load_session(body.session_id)
+        logger.info(f"Session context not found in memory for session_id={body.session_id}. Attempting to load from persistence.")
+        if not persisted:
+            raise HTTPException(404, "Session not found or expired.")
+        ctx = _cp_rebuild_ctx(persisted)
+        logger.info(ctx)
+        await get_session_store().register(ctx)  # restore into memory
+
+    # ctx.tables is always present (dataclass default=[]), but may be empty
+    # if /tables was never called. Re-extract when the list is empty.
+    if not ctx.tables:
+        pipeline_pre = TrainingPipeline()
+        cached = pipeline_pre._load_schema_cache(ctx.db_key) if ctx.db_key else None
+        if cached:
+            ctx.tables, _ = cached
+            logger.info(f"[chronoplot] Loaded {len(ctx.tables)} tables from cache.")
+        elif ctx.connection_string:
+            logger.info(f"[chronoplot] No cache found, rebuilding engine from connection_string.")
+            ctx.engine = connector.from_connection_string(ctx.connection_string)
+            ctx.tables = await pipeline_pre.extract_only(body.session_id, ctx.engine)
+            logger.info(f"[chronoplot] Extracted {len(ctx.tables)} tables from DB.")
+        else:
+            raise HTTPException(400, "No cached schema and no connection string available.")
+
+
 
     user_desc_map = {t.table_name: t.user_description for t in body.tables if t.user_description}
     pipeline = TrainingPipeline()
@@ -1703,6 +1731,7 @@ async def chronoplot_chat_query(request: Request, body: ChronoChatRequest, _toke
                         table_schemas=table_schemas,
                         column_mappings=column_mappings
                     )
+                    logger.info(f"Filtered SQL applied: {safe_sql}")
                 except PermissionError as exc:
                     return ChronoChatResponse(mode="empty", text_summary=str(exc), sql_used=val_result.sql)
                 except Exception as exc:

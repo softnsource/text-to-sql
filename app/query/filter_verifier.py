@@ -16,6 +16,7 @@ class SQLFilterVerifier:
     def __init__(self, dialect: str = "sqlite"):
         self.dialect = dialect
 
+    
     def verify_and_inject(
         self, 
         sql: str, 
@@ -83,30 +84,34 @@ class SQLFilterVerifier:
             # Check for table-specific mappings
             table_mappings = (column_mappings or {}).get(t_name, {})
             norm_table_mappings = {k.lower(): v for k, v in table_mappings.items()}
+            def normalize(col: str) -> str:
+                return col.replace("_", "").lower()
+
+            raw_columns = table_schemas.get(t_name, [])
+            normalized_columns = {normalize(c): c for c in raw_columns}
 
             table_applied_keys = []
             for key in filter_keys:
                 k_lower = key.lower()
-                
-                # Determine actual column name (mapping or direct)
+                norm_key = normalize(key)
+
+                # Check mapping first
                 actual_col = norm_table_mappings.get(k_lower)
-                if actual_col:
-                    logger.info(f"Using mapped column '{actual_col}' for filter key '{key}' on table '{t_name}'")
-                elif k_lower in available_cols:
-                    actual_col = key  # Use the original key name
-                
+
+                # Then normalized match
+                if not actual_col:
+                    actual_col = normalized_columns.get(norm_key)
+
                 if actual_col:
                     val = norm_filter_values.get(k_lower)
-                    logger.info(f"Matching key '{key}' (col: '{actual_col}') for table '{t_name}'. Value found: {val}")
-                    
+
                     if val is not None and val != "":
-                        # Handle value formatting
                         if isinstance(val, str):
                             escaped_val = val.replace("'", "''")
                             condition = f"{t_alias}.{actual_col} = '{escaped_val}'"
                         else:
                             condition = f"{t_alias}.{actual_col} = {val}"
-                        
+
                         filters_to_inject.append(condition)
                         table_applied_keys.append(key)
                     else:
