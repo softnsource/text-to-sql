@@ -37,6 +37,7 @@ class UniversalConnector:
         self.settings = get_settings()
         self._uploads_dir = Path(self.settings.uploads.dir)
         self._uploads_dir.mkdir(parents=True, exist_ok=True)
+        self._engine_cache: dict[str, Engine] = {}
 
     def from_upload(self, session_id: str, file_bytes: bytes, filename: str) -> Engine:
         """Save uploaded SQLite file and create engine.
@@ -80,18 +81,6 @@ class UniversalConnector:
         return self._make_engine(url, "sqlite")
 
     def from_connection_string(self, conn_str: str) -> Engine:
-        """Create engine from a connection string.
-
-        Args:
-            conn_str: SQLAlchemy-compatible connection string
-
-        Returns:
-            Read-only SQLAlchemy Engine
-
-        Raises:
-            UnsupportedDialectError: If dialect cannot be determined
-            ConnectionError: If connection fails
-        """
         conn_str = conn_str.strip()
         dialect = self._detect_dialect(conn_str)
 
@@ -105,7 +94,14 @@ class UniversalConnector:
         elif conn_str.startswith("mssql://"):
             conn_str = conn_str.replace("mssql://", "mssql+pyodbc://", 1)
 
-        return self._make_engine(conn_str, dialect)
+        # Return cached engine if one already exists for this connection string
+        if conn_str in self._engine_cache:
+            return self._engine_cache[conn_str]
+
+        engine = self._make_engine(conn_str, dialect)
+        self._engine_cache[conn_str] = engine
+        return engine
+
 
     def cleanup_session(self, session_id: str) -> None:
         """Delete uploaded files for a session.

@@ -38,6 +38,7 @@ from app.db.persistent_session_store import load_session, save_session
 from app.query.spelling_corrector import QuestionCorrector
 from jose import JWTError, jwt as jose_jwt
 from sqlalchemy import create_engine, text as sa_text
+from sqlalchemy.engine import Engine
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -1306,24 +1307,33 @@ def _cp_decode_jwt(token: str) -> dict:
     except JWTError as exc:
         raise HTTPException(status_code=401, detail=f"Invalid JWT: {exc}")
 
+_CP_ROLE_ENGINE: Engine | None = None
+
+def _cp_get_role_engine() -> Engine:
+    global _CP_ROLE_ENGINE
+    if _CP_ROLE_ENGINE is None:
+        conn_str = os.environ.get("CHRONOPLOT_DB_CONN", "")
+        if not conn_str:
+            raise HTTPException(
+                status_code=500,
+                detail="Server misconfiguration: CHRONOPLOT_DB_CONN env variable is not set.",
+            )
+        try:
+            _CP_ROLE_ENGINE = create_engine(
+                conn_str,
+                pool_pre_ping=True,
+                pool_size=2,
+                max_overflow=3,
+                pool_recycle=1800,
+            )
+        except Exception as exc:
+            logger.error(f"[chronoplot] Failed to create role engine: {exc}", exc_info=True)
+            raise HTTPException(status_code=500, detail="Could not connect to chronoplot_DB for role check.")
+    return _CP_ROLE_ENGINE
+
 
 def _cp_check_role(user_detail_id: str) -> int:
-    """
-    Query BNR_UserDetails for the given user ID.
-    Raises HTTP 403 if UserType is not SuperAdmin (2), SiteAdmin (3) or Manager (4).
-    Returns the UserType value.
-    """
-    conn_str = os.environ.get("CHRONOPLOT_DB_CONN", "")
-    if not conn_str:
-        raise HTTPException(
-            status_code=500,
-            detail="Server misconfiguration: CHRONOPLOT_DB_CONN env variable is not set.",
-        )
-    try:
-        cp_engine = create_engine(conn_str, pool_pre_ping=True)
-    except Exception as exc:
-        logger.error(f"[chronoplot] Failed to create engine: {exc}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Could not connect to chronoplot_DB for role check.")
+    cp_engine = _cp_get_role_engine()  
 
     sql = sa_text(
         "SELECT [UserType] FROM [chronoplot_DB].[dbo].[BNR_UserDetails] WHERE Id = :uid"
