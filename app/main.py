@@ -1403,6 +1403,30 @@ def _cp_rebuild_ctx(persisted: dict) -> SessionContext:
 
 
 # ─── Chronoplot Request / Response models ─────────────────────────────────
+def save_message(thread_id, role, content, **kwargs):
+    if not thread_id:
+        return
+    db = AppDBSession()
+    try:
+        msg = ChatThreadMessage(
+            thread_id=thread_id,
+            role=role,
+            content=content,
+            sql_used=kwargs.get("sql_used"),
+            table_data=kwargs.get("table_data"),
+            columns=kwargs.get("columns"),
+            stats=kwargs.get("stats"),
+            visualization_hint=kwargs.get("visualization_hint"),
+            chart_x_axis=kwargs.get("chart_x_axis"),
+            chart_y_axis=kwargs.get("chart_y_axis"),
+            explanation=kwargs.get("explanation"),
+        )
+        db.add(msg)
+        db.commit()
+    except Exception as e:
+        logger.error(f"[chronoplot] Save message failed: {e}", exc_info=True)
+    finally:
+        db.close()
 
 class ChronoConnectResponse(BaseModel):
     session_id: str
@@ -1649,6 +1673,7 @@ async def chronoplot_chat_query(request: Request, body: ChronoChatRequest, _toke
     )
 
     question = await corrector.correct(body.question)
+    save_message(body.thread_id, "user", question)
     logger.info(f"[chronoplot] Corrected question: {question}")
     eng = connector.from_connection_string(ctx.connection_string)
 
@@ -1686,10 +1711,13 @@ async def chronoplot_chat_query(request: Request, body: ChronoChatRequest, _toke
                 conversation_context=conversation_context,
             )
             if plan.needs_clarification and not plan.relevant_tables:
+                text = "\n".join(plan.clarification_questions)
+                save_message(body.thread_id, "assistant", text)
                 return ChronoChatResponse(mode="empty", text_summary="\n".join(plan.clarification_questions))
 
             gen_result = await generator.generate(plan, conversation_context, ctx.qdrant_collection)
             if gen_result.chat_response and not gen_result.sql:
+                save_message(body.thread_id, "assistant", gen_result.chat_response)
                 return ChronoChatResponse(mode="chat", text_summary=gen_result.chat_response, explanation=gen_result.explanation)
 
             val_result = validator.validate(gen_result.sql, ctx.dialect)
@@ -1775,22 +1803,19 @@ async def chronoplot_chat_query(request: Request, body: ChronoChatRequest, _toke
             ))
 
             if body.thread_id:
-                db_s = AppDBSession()
-                try:
-                    db_s.add(ChatThreadMessage(thread_id=body.thread_id, role="user", content=question))
-                    db_s.add(ChatThreadMessage(
-                        thread_id=body.thread_id, role="assistant",
-                        content=formatted.text_summary, sql_used=safe_sql,
-                        table_data=formatted.table_data, columns=formatted.columns,
-                        stats=formatted.stats, visualization_hint=formatted.visualization_hint,
-                        chart_x_axis=formatted.chart_x_axis, chart_y_axis=formatted.chart_y_axis,
-                        explanation=formatted.explanation,
-                    ))
-                    db_s.commit()
-                except Exception as exc:
-                    logger.error(f"[chronoplot] Failed to save messages: {exc}", exc_info=True)
-                finally:
-                    db_s.close()
+                save_message(
+                    body.thread_id,
+                    "assistant",
+                    formatted.text_summary,
+                    sql_used=safe_sql,
+                    table_data=formatted.table_data,
+                    columns=formatted.columns,
+                    stats=formatted.stats,
+                    visualization_hint=formatted.visualization_hint,
+                    chart_x_axis=formatted.chart_x_axis,
+                    chart_y_axis=formatted.chart_y_axis,
+                    explanation=formatted.explanation,
+                )
 
             return ChronoChatResponse(
                 mode=formatted.mode, text_summary=formatted.text_summary,
@@ -1811,6 +1836,7 @@ async def chronoplot_chat_query(request: Request, body: ChronoChatRequest, _toke
 
     if zero_rows_on_last_attempt:
         no_data_text = await formatter._humanize_no_data(question)
+        save_message(body.thread_id, "assistant", no_data_text)
         return ChronoChatResponse(mode="no_data", text_summary=no_data_text, page=1, pages_total=1)
 
     return ChronoChatResponse(

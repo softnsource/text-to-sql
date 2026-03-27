@@ -243,6 +243,40 @@ class SQLGenerator:
             This applies universally to all tables and all columns in the schema.
             
             =====================
+            EXPLICIT LIMIT DETECTION (HIGHEST PRIORITY)
+            =====================
+
+            If the user explicitly mentions a number of records, you MUST ALWAYS apply that limit.
+
+            This OVERRIDES all other rules including table row count.
+
+            Detect patterns like:
+            - "top 10"
+            - "first 5"
+            - "last 20"
+            - "show 15"
+            - "give me 100"
+            - "limit 50"
+            - "only 25 records"
+
+            RULES:
+            - Extract the number N from the user query
+            - Apply TOP N (SQL Server) or LIMIT N (other dialects)
+            - NEVER ignore this even if table has fewer than 2000 rows
+
+            EXAMPLES:
+            User: "Give me top 10 incidents"
+            → SELECT TOP 10 ...
+
+            User: "Show 5 users"
+            → SELECT TOP 5 ...
+
+            User: "List 20 records"
+            → SELECT TOP 20 ...
+
+            This rule has STRICT PRIORITY over all LIMIT/TOP logic below.
+            
+            =====================
             LIMIT / TOP RULE (CRITICAL)
             =====================
             
