@@ -1651,7 +1651,7 @@ async def chronoplot_chat_query(request: Request, body: ChronoChatRequest, _toke
     Requires Authorization: Bearer <jwt> with UserType SuperAdmin(2) or Manager(4).
     """
     user_detail_id, user_type, jwt_payload = _cp_authorize(request)
-
+    last_successful_sql = ""
     ctx = await get_session_store().get(body.session_id)
     if not ctx:
         persisted = load_session(body.session_id)
@@ -1728,6 +1728,7 @@ async def chronoplot_chat_query(request: Request, body: ChronoChatRequest, _toke
                 continue
 
             safe_sql = val_result.sql
+            last_successful_sql = safe_sql
 
             # Apply mandatory filters for non-owners (Managers and SiteAdmins)
             logger.info(f"Chronoplot Filter : {getattr(ctx, 'common_filter_keys', None)} Is super admin : {is_super_admin}")
@@ -1766,6 +1767,7 @@ async def chronoplot_chat_query(request: Request, body: ChronoChatRequest, _toke
                 except Exception as exc:
                     logger.error(f"[chronoplot] Filter injection failed: {exc}", exc_info=True)
                     return ChronoChatResponse(mode="empty", text_summary="Security verification failed.")
+            last_successful_sql = safe_sql
 
             result = await executor.execute(eng, safe_sql)
 
@@ -1838,7 +1840,13 @@ async def chronoplot_chat_query(request: Request, body: ChronoChatRequest, _toke
     if zero_rows_on_last_attempt:
         no_data_text = await formatter._humanize_no_data(question)
         save_message(body.thread_id, "assistant", no_data_text)
-        return ChronoChatResponse(mode="no_data", text_summary=no_data_text, page=1, pages_total=1)
+        return ChronoChatResponse(
+            mode="no_data",
+            text_summary=no_data_text,
+            sql_used=last_successful_sql,
+            page=1,
+            pages_total=1
+        )
     no_data_text = await formatter._humanize_no_data(question)
     return ChronoChatResponse(
         mode="empty",

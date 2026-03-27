@@ -172,6 +172,18 @@ class SQLGenerator:
             - Always use UNION ALL (not UNION) unless deduplication is explicitly needed.
             
             =====================
+            ANTI-HALLUCINATION RULE (HIGHEST PRIORITY)
+            =====================
+
+            You are FORBIDDEN from inventing any column or table name.
+            If you cannot find an EXACT column that matches the user's intent after carefully splitting every schema column name into English words, then:
+            - Do NOT guess or create a column like "CqcNotification", "HasCqcNotification", etc.
+            - Instead, return sql = "" and set chat_response to a polite message asking for clarification, e.g.:
+            "I couldn't find a column related to 'CQC notification'. Could you tell me the exact field name or describe it differently?"
+
+            Only use column names that appear verbatim (case-insensitive) in the provided DATABASE SCHEMA.
+
+            =====================
             COLUMN SELECTION RULE (CRITICAL)
             =====================
             For select column use all tables columns you can use join tables columns also if available
@@ -376,8 +388,9 @@ class SQLGenerator:
             response = await get_key_manager().generate_content(
                 prompt,
                 generation_config=genai.GenerationConfig(
-                    temperature=0.05,
+                    temperature=0.0,
                     max_output_tokens=self.settings.gemini.max_tokens,
+                    response_mime_type="application/json",
                 ),
             )
             response_text = response.text.strip()
@@ -385,19 +398,27 @@ class SQLGenerator:
             # Model sometimes reasons out loud before the JSON block.
             # Grab the first { ... } block regardless of what surrounds it.
             import re
-            json_match = re.search(r'{[\s\S]*}', response_text)
+            json_match = re.search(r'(\{[\s\S]*?\})', response_text, re.DOTALL)
             if json_match:
-                response_text = json_match.group(0).strip()
+                json_str = json_match.group(1)
             else:
-                # Fallback: strip markdown fences
-                for prefix in ("```json", "```"):
-                    if response_text.startswith(prefix):
-                        response_text = response_text[len(prefix):]
-                if response_text.endswith("```"):
-                    response_text = response_text[:-3]
-                response_text = response_text.strip()
+                # Fallback: remove common markdown and extra lines
+                json_str = response_text
+                for prefix in ("```json", "```", "json"):
+                    json_str = json_str.replace(prefix, "")
+                json_str = json_str.strip()
 
-            data = json.loads(response_text)
+            # Clean up any trailing text after the JSON
+            # This handles the "Extra data" error
+            try:
+                # Use raw_decode to get only the first valid JSON object
+                decoder = json.JSONDecoder()
+                data, idx = decoder.raw_decode(json_str)
+                # If there's extra text after, we ignore it
+            except json.JSONDecodeError:
+                # Final aggressive cleanup
+                json_str = re.sub(r'^.*?(\{.*\})', r'\1', json_str, flags=re.DOTALL)
+                data = json.loads(json_str)
             sql = data.get("sql", "").strip().rstrip(";")
             chat_response = data.get("chat_response", "").strip()
             response_intent = data.get("response_intent", "data").strip()
