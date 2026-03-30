@@ -90,7 +90,6 @@ class QueryPlanner:
                 relevant_tables=[],
                 dialect=dialect,
             )
-        logger.info(f"Qdrant returned {raw_results} candidate tables for planning.")
         # Convert raw Qdrant payloads → TableContext objects
         candidate_tables = [self._payload_to_context(p) for p in raw_results]
 

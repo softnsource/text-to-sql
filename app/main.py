@@ -1778,15 +1778,17 @@ async def chronoplot_chat_query(request: Request, body: ChronoChatRequest, _toke
                     column_mappings = {
                         "bnr_sites": { "site_id": "id", "siteid": "id" }
                     }
-
-                    safe_sql = verifier.verify_and_inject(
-                        sql=safe_sql,
-                        filter_keys=ctx.common_filter_keys,
-                        filter_values=filter_values,
-                        table_schemas=table_schemas,
-                        column_mappings=column_mappings
-                    )
-                    logger.info(f"Filtered SQL applied: {safe_sql}")
+                    if verifier.should_bypass_filter(safe_sql,ctx.dialect):
+                        logger.info("Skip Filter Injection as SQL is read-only and does not reference any filter keys.")
+                    else:
+                        safe_sql = verifier.verify_and_inject(
+                            sql=safe_sql,
+                            filter_keys=ctx.common_filter_keys,
+                            filter_values=filter_values,
+                            table_schemas=table_schemas,
+                            column_mappings=column_mappings
+                        )
+                        logger.info(f"Filtered SQL applied: {safe_sql}")
                 except PermissionError as exc:
                     return ChronoChatResponse(mode="empty", text_summary=str(exc), sql_used=val_result.sql)
                 except Exception as exc:
