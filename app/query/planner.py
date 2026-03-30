@@ -27,6 +27,7 @@ class TableContext:
     foreign_keys: List[Dict]  # [{from, to_table, to_col}]
     row_count: int
     sample_rows: List[Dict] = field(default_factory=list)
+    reverse_foreign_keys: List[Dict] = field(default_factory=list)  # ← NEW
 
 
 @dataclass
@@ -89,12 +90,13 @@ class QueryPlanner:
                 relevant_tables=[],
                 dialect=dialect,
             )
-
+        logger.info(f"Qdrant returned {raw_results} candidate tables for planning.")
         # Convert raw Qdrant payloads → TableContext objects
         candidate_tables = [self._payload_to_context(p) for p in raw_results]
 
         # Step 2: Ask Gemini which of these candidates are actually needed
         schema_context = self._build_schema_context(candidate_tables)
+        logger.info(f"Created Schema : {schema_context}")
         analysis = await self._analyze_with_gemini(
             question, schema_context, conversation_context
         )
@@ -127,10 +129,24 @@ class QueryPlanner:
                 f"{c['name']} ({c['type']})" + (" [PK]" if c.get("is_pk") else "")
                 for c in t.columns[:10]
             )
+            # Forward FKs
+            fk_out = " | ".join(
+                f"{fk['from']} → {fk['to_table']}.{fk['to_col']}"
+                for fk in t.foreign_keys
+            ) if t.foreign_keys else "none"
+
+            # Reverse FKs — who points AT this table
+            fk_in = " | ".join(
+                f"{r['referencing_table']}.{r['referencing_col']} → {t.table_name}.{r['local_col']}"
+                for r in t.reverse_foreign_keys
+            ) if t.reverse_foreign_keys else "none"
+
             lines.append(
                 f"Table: {t.table_name} ({t.row_count:,} rows)\n"
                 f"  Desc: {t.description[:100]}...\n"
                 f"  Cols: {col_summary}\n"
+                f"  FK (out): {fk_out}\n"
+                f"  FK (in):  {fk_in}\n"   # ← NEW
             )
         return "\n".join(lines)
 
@@ -140,6 +156,7 @@ class QueryPlanner:
         schema_context: str,
         history: str,
     ) -> dict:
+        logger.info(f"Schema Context for Gemini:\n{schema_context}")
         history_block = f"\n{history}\n" if history else ""
         prompt = f'''Expert table selector. Pick EXACT table names from list ONLY.
 
@@ -205,6 +222,7 @@ RULES:
             foreign_keys=payload.get("foreign_keys", []),
             row_count=payload.get("row_count", 0),
             sample_rows=samples,
+            reverse_foreign_keys=payload.get("reverse_foreign_keys", []),
         )
 
     def _error_plan(self, question: str, dialect: str, msg: str) -> QueryPlan:

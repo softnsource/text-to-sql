@@ -494,7 +494,15 @@ class TrainingPipeline:
     # ─────────────────────────────────────────────────────────────
     def _write_schema_report(self, session_id: str, tables, descriptions: dict):
         settings = get_settings()
-
+        reverse_fk_map: dict[str, list] = {}
+        for table in tables:
+            for fk in table.foreign_keys:
+                target = fk["to_table"]
+                reverse_fk_map.setdefault(target, []).append({
+                    "referencing_table": table.table_name,
+                    "referencing_col":   fk["from"],
+                    "local_col":         fk["to_col"],
+                })
         report = []
         for table in tables:
             desc = descriptions.get(table.table_name, "")
@@ -506,6 +514,7 @@ class TrainingPipeline:
                 "columns": [{"name": c.name, "type": c.data_type, "nullable": c.nullable} for c in table.columns],
                 "primary_keys": table.primary_keys,
                 "foreign_keys": table.foreign_keys,
+                "reverse_foreign_keys": reverse_fk_map.get(table.table_name, []),
                 "sample_rows": table.sample_rows,
                 "ai_description": desc,
             })

@@ -90,6 +90,17 @@ class Indexer:
         else:
             logger.info(f"Collection already exists: {collection}")
 
+        reverse_fk_map: dict[str, list[dict]] = {}
+        for table in tables:
+            for fk in table.foreign_keys:          # {"from": col, "to_table": t, "to_col": c}
+                target = fk["to_table"]
+                reverse_fk_map.setdefault(target, []).append({
+                    "referencing_table": table.table_name,
+                    "referencing_col":   fk["from"],
+                    "local_col":         fk["to_col"],
+                })
+        logger.info(f"Built reverse FK map for {len(reverse_fk_map)} tables")
+
         # Build points
         points: List[PointStruct] = []
         for table in tables:
@@ -99,7 +110,7 @@ class Indexer:
             logger.info(f"Embedding table {table.table_name}")
             embedding = await self._embed(embed_text)
             logger.info(f"Vector length: {len(embedding)}")
-
+            rfks = reverse_fk_map.get(table.table_name, [])
             points.append(
                 PointStruct(
                     id=str(uuid4()),
@@ -115,6 +126,7 @@ class Indexer:
                             for c in table.columns
                         ],
                         "foreign_keys": table.foreign_keys,
+                        "reverse_foreign_keys": rfks,
                     }
                 )
             )

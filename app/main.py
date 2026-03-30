@@ -1241,30 +1241,55 @@ def _extract_db_name(conn_str: str) -> str:
     except Exception:
         return "database"
 
-async def _get_table_schemas(ctx: SessionContext) -> Dict[str, List[str]]:
-    """Fetch all table schemas (column names) for the session."""
+async def _get_table_schemas(ctx: SessionContext) -> Dict[str, Any]:
+    """
+    Fetch full table schema payloads for the session.
+
+    Returns Dict[str, dict] — full payload per table (includes reverse_foreign_keys).
+    The filter verifier supports both full payloads and plain column lists,
+    so this change is backward-compatible.
+    """
     if ctx.tables:
-        return {t.table_name.lower(): [c.name for c in t.columns] for t in ctx.tables}
-    
-    # Fallback to Qdrant (for loaded models)
+        # ctx.tables are TableInfo objects — build a payload-shaped dict manually.
+        # reverse_foreign_keys are NOT on TableInfo, so we compute them here
+        # the same way the indexer does.
+        reverse_fk_map: Dict[str, list] = {}
+        for t in ctx.tables:
+            for fk in t.foreign_keys:
+                target = fk["to_table"].lower()
+                reverse_fk_map.setdefault(target, []).append({
+                    "referencing_table": t.table_name,
+                    "referencing_col":   fk["from"],
+                    "local_col":         fk["to_col"],
+                })
+
+        schemas = {}
+        for t in ctx.tables:
+            schemas[t.table_name.lower()] = {
+                "table_name":           t.table_name,
+                "columns":              [{"name": c.name, "type": c.data_type} for c in t.columns],
+                "foreign_keys":         t.foreign_keys,
+                "reverse_foreign_keys": reverse_fk_map.get(t.table_name.lower(), []),
+                "row_count":            t.row_count,
+            }
+        return schemas
+
+    # Fallback: load from Qdrant (session restored from saved model, no ctx.tables)
     from app.training.indexer import Indexer
     indexer = Indexer()
     try:
-        # Search with a broad query to get all table payloads
-        results = await indexer.search(ctx.qdrant_collection, "list all tables", top_k=200)
+        results = await indexer.search(
+            ctx.qdrant_collection,
+            "list all tables",
+            top_k=200,
+        )
         schemas = {}
         for r in results:
             t_name = r.get("table_name", "").lower()
-            # columns could be list of strings or list of dicts
-            cols_raw = r.get("columns", [])
-            cols = []
-            for c in cols_raw:
-                if isinstance(c, dict):
-                    cols.append(c.get("name", ""))
-                else:
-                    cols.append(str(c))
             if t_name:
-                schemas[t_name] = cols
+                # r is already the full Qdrant payload — store it as-is.
+                # reverse_foreign_keys is present because the indexer stores it.
+                schemas[t_name] = r
         return schemas
     except Exception as e:
         logger.error(f"Failed to fetch schemas from Qdrant: {e}")
