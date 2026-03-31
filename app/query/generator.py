@@ -67,6 +67,78 @@ class SQLGenerator:
         else:
             limit_syntax = f"Place LIMIT {max_rows} at the end of the query: SELECT col1, col2 ... LIMIT {max_rows}"
 
+        user_entity_block = ""
+        if plan.resolved_user_table and plan.user_entity_name:
+            user_entity_block = f"""
+        =====================
+        USER ENTITY RESOLUTION (HIGHEST PRIORITY)
+        =====================
+        The user mentioned a person named "{plan.user_entity_name}".
+        This person has been identified as belonging to table: {plan.resolved_user_table}
+
+        STEP 1 — CLEAN THE NAME FIRST (MANDATORY):
+        Before building any filter, strip possessive suffixes and punctuation from the name:
+        - Remove trailing "'s", "'s", "`s", ",s" → "Louis's" becomes "Louis", "Lois's" becomes "Lois"
+        - Remove any trailing punctuation: periods, commas, apostrophes
+        - Use ONLY the cleaned name in all LIKE filters
+        - NEVER use the raw possessive form in a WHERE clause
+
+        STEP 2 — NAME COLUMN DETECTION (MANDATORY):
+        Look at the SCHEMA columns for {plan.resolved_user_table}.
+        Build the WHERE clause using ONLY columns from this EXACT ALLOWED LIST that exist in the schema:
+
+        ALLOWED name columns ONLY (check schema, use only if present):
+        - PreferredName, Preferred_Name, KnownAs, NickName        ← preferred name
+        - FirstName, First_Name, Forename, GivenName              ← first name
+        - LastName, Last_Name, Surname, FamilyName                ← last name
+        - FullName, Full_Name, DisplayName                        ← combined name
+
+        STRICTLY FORBIDDEN — NEVER use these for name search, even if they exist:
+        - Email, EmailAddress, Email_Address
+        - Phone, PhoneNumber, Phone_Number, Mobile, MobileNumber, ContactNumber
+        - Username, UserName, LoginName, Login
+        - Any column containing "Id", "Code", "Ref", "Key"
+        - Any column with type INT, BIT, DATE, DATETIME
+
+        STEP 3 — BUILD THE FILTER using ONLY the matched ALLOWED columns:
+        When an entity name is provided:
+        - ALWAYS prioritize filtering by PreferredName, Preferred_Name, KnownAs, NickName if they exist in the schema.
+        - If preferred name columns are not present, then use FirstName, First_Name, Forename, GivenName AND LastName, Last_Name, Surname, FamilyName if both first and last name components of the user entity can be identified.
+        - If neither preferred name nor distinct first/last name columns are suitable, use FullName, Full_Name, DisplayName.
+        - NEVER compare email or phone number columns with the entity name.
+        - The model should infer first and last names from the user_entity_name (e.g., "Hardik Pandya" → "Hardik" for first name, "Pandya" for last name) and use them for filtering respective columns if they exist.
+
+        Combine found columns with OR:
+
+        GOOD:
+        WHERE (
+            t1.FirstName LIKE 
+            OR t1.LastName LIKE 
+            OR t1.PreferredName LIKE 
+        )
+
+        BAD — NEVER do this:
+        WHERE (
+            t1.FirstName LIKE 
+            OR t1.Email LIKE 
+            OR t1.Phone LIKE 
+        )
+
+        Example — if only FullName exists:
+        WHERE t1.FullName LIKE 
+
+        STRICT RULES:
+        - NEVER filter on Email or Phone number columns when resolving user entities. These are not name fields and can lead to false positives. Only use the allowed name-like columns specified above.
+        - NEVER filter on a name column that is NOT listed in the SCHEMA for {plan.resolved_user_table}
+        - NEVER invent columns like "Name", "UserName" if they don\_t exist in SCHEMA
+        - NEVER use the possessive form (Louis\_s) in LIKE — always use the cleaned name (Louis)
+        - Always use OR between name columns, never AND
+        - JOIN from {plan.resolved_user_table} to other relevant tables using FK relationships in SCHEMA
+        - NEVER use a different user/person table for this entity
+        - DO NOT USE Email and Phone number columns for user entity resolution. These are not name fields and can lead to false positives. Only use the allowed name-like columns specified above.
+        
+        """
+
         prompt = f"""
             You are a SQL generator.
             
@@ -81,7 +153,7 @@ class SQLGenerator:
             DATABASE SCHEMA
             =====================
             {schema_context}
-            
+            {user_entity_block} 
             =====================
             USER QUESTION
             =====================
@@ -154,6 +226,7 @@ class SQLGenerator:
             If one branch naturally has fewer meaningful columns, pad it with NULL
             placeholders using aliases that match the first branch.
             
+            9. If PreferredName columns exist, prioritize them for user entity resolution. also if we have firstname only then also check the prefered name columns. if both given first name and lastname exist check with both
             RULES:
             - Count columns in branch 1 first, then match exactly in branch 2.
             - Use NULL AS <alias> for columns that don't apply to a branch.
@@ -388,7 +461,6 @@ class SQLGenerator:
             "reason": "intent name"
             }}
         """
-
 
         response_text = None
         try:

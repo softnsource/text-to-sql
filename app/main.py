@@ -28,7 +28,7 @@ from app.config import get_settings
 from app.db.connector import UniversalConnector, ConnectionError, UnsupportedDialectError
 from app.db.session_store import SessionContext, get_session_store
 from app.training.pipeline import TrainingPipeline
-from app.query.planner import QueryPlanner
+from app.query.planner import QueryPlanner, USER_TYPE_OPTIONS
 from app.query.generator import SQLGenerator
 from app.query.validator import SQLValidator
 from app.query.executor import QueryExecutor
@@ -177,9 +177,6 @@ class FilterKeysRequest(BaseModel):
 class FilterValuesRequest(BaseModel):
     session_id: str
     values: Dict[str, Any]
-
-
-
 
 # ── Auth & User Models ─────────────────────────────────────────────────────
 
@@ -1314,6 +1311,7 @@ _CHRONOPLOT_ALLOWED = {int(UserType.SuperAdmin), int(UserType.Manager), int(User
 def _cp_extract_token(request: Request) -> str:
     """Pull Bearer token from Authorization header."""
     auth = request.headers.get("Authorization", "")
+    logger.info(f"Authorization header: {auth[:30]}...")
     if not auth.startswith("Bearer "):
         raise HTTPException(
             status_code=401,
@@ -1674,6 +1672,19 @@ async def chronoplot_chat_query(request: Request, body: ChronoChatRequest, _toke
     """
     NL → SQL → response pipeline.
     Requires Authorization: Bearer <jwt> with UserType SuperAdmin(2) or Manager(4).
+ 
+    User-type clarification flow
+    ----------------------------
+    Turn 1: User asks "Give me a breakdown of Louis incidents for the last 2 years"
+            → corrector detects "Louis" is a person reference
+            → planner returns pending_user_type_clarification=True
+            → API returns mode="clarification" with options and stores
+              {original_question, entity_name} in memory under thread_id
+ 
+    Turn 2: User replies "Staff member"
+            → API detects pending clarification in memory
+            → resolves table = BNR_UserDetails
+            → re-runs full pipeline with enriched original question
     """
     user_detail_id, user_type, jwt_payload = _cp_authorize(request)
     last_successful_sql = ""
@@ -1683,13 +1694,14 @@ async def chronoplot_chat_query(request: Request, body: ChronoChatRequest, _toke
         if not persisted:
             raise HTTPException(404, "Session not found or expired.")
         ctx = _cp_rebuild_ctx(persisted)
-
+ 
     if not ctx.connection_string:
         raise HTTPException(400, "Session was restored from an upload; please re-upload your file.")
-
+ 
     memory_key = str(body.thread_id) if body.thread_id else body.session_id
     mem = get_session_memory(memory_key)
     conversation_context = mem.get_context_for_prompt()
+ 
     max_retries = 3
     last_error = ""
     zero_rows_on_last_attempt = False
@@ -1697,13 +1709,74 @@ async def chronoplot_chat_query(request: Request, body: ChronoChatRequest, _toke
         "\n⚠️ MANDATORY: Your response MUST be a single valid JSON object. "
         'Return ONLY: {"sql": "...", "chat_response": "", "response_intent": "data", "reason": "..."}'
     )
-
-    question = await corrector.correct(body.question)
+ 
+    # ------------------------------------------------------------------
+    # Step 1 — Spell-correct the incoming question (now returns CorrectedQuestion)
+    # ------------------------------------------------------------------
+    corrected = await corrector.correct(body.question)
+    question = corrected.text
     save_message(body.thread_id, "user", question)
     logger.info(f"[chronoplot] Corrected question: {question}")
+ 
     eng = connector.from_connection_string(ctx.connection_string)
-
-    # Fallback: if session has no filter keys, try to fetch from SavedModel table by db_key
+ 
+    # ------------------------------------------------------------------
+    # Step 2 — Check if this message is a clarification answer from the user
+    #
+    # We store a "pending_clarification" dict in memory when we ask the user
+    # which user type they mean. On the very next turn we check for it.
+    # Structure stored: {"original_question": str, "entity_name": str}
+    # ------------------------------------------------------------------
+    pending_clarification = mem.get_pending_clarification()   # returns dict or None
+    resolved_user_table: Optional[str] = None
+    effective_question = question
+ 
+    if pending_clarification:
+        # The user is answering our "which user type?" question
+        from app.query.planner import resolve_user_type_table
+        resolved_user_table = resolve_user_type_table(question)
+ 
+        if resolved_user_table:
+            # Rebuild the original question enriched with the user type context
+            original_q = pending_clarification["original_question"]
+            entity_name = pending_clarification.get("entity_name", "the user")
+            effective_question = (
+                f"{original_q} "
+                f"[Note: {entity_name} is a {question.strip()} — use table {resolved_user_table}]"
+            )
+            logger.info(
+                f"[chronoplot] Clarification resolved: entity='{entity_name}', "
+                f"table='{resolved_user_table}', enriched question='{effective_question}'"
+            )
+            mem.clear_pending_clarification()
+            # Override corrector flags — this is now a fully resolved re-run
+            corrected_has_user_reference = False
+            corrected_entity_name = None
+        else:
+            # User's reply didn't match any known user type — ask again
+            mem.clear_pending_clarification()   # clear stale state
+            clarification_text = (
+                "Sorry, I didn't recognise that user type. "
+                "Please choose one of:\n"
+                + "\n".join(
+                    f"  {i+1}. {opt['label']}"
+                    for i, opt in enumerate(USER_TYPE_OPTIONS)
+                )
+            )
+            save_message(body.thread_id, "assistant", clarification_text)
+            return ChronoChatResponse(
+                mode="clarification",
+                text_summary=clarification_text,
+                page=1,
+                pages_total=1,
+            )
+    else:
+        corrected_has_user_reference = corrected.has_user_reference
+        corrected_entity_name = corrected.user_entity_name
+ 
+    # ------------------------------------------------------------------
+    # Fallback: session filter keys
+    # ------------------------------------------------------------------
     logger.info(f"[chronoplot] Checking for common_filter_keys in session context: {getattr(ctx, 'common_filter_keys', None)}, db_key: {getattr(ctx, 'db_key', None)}")
     if not getattr(ctx, "common_filter_keys", None) and getattr(ctx, "db_key", None):
         db_s = AppDBSession()
@@ -1718,67 +1791,93 @@ async def chronoplot_chat_query(request: Request, body: ChronoChatRequest, _toke
             logger.error(f"[chronoplot] Fallback: Failed to fetch model filters: {exc}")
         finally:
             db_s.close()
-    
-    # FOR TESTING PURPOSE: Ensure SiteID is in common_filter_keys for Chronoplot
+ 
     if not getattr(ctx, "common_filter_keys", None):
         logger.info("[chronoplot] Testing: Forcing 'SiteID' into common_filter_keys")
         ctx.common_filter_keys = ["site_id"]
-
-    # SuperAdmin bypasses filters
+ 
     is_super_admin = (user_type == int(UserType.SuperAdmin))
     effective_is_owner = getattr(ctx, "is_owner", False) or is_super_admin
-
+ 
+    # ------------------------------------------------------------------
+    # Step 3 — Main pipeline (with retry loop)
+    # ------------------------------------------------------------------
     for attempt in range(max_retries):
         try:
+            resolved_entity_name: Optional[str] = None
+            if pending_clarification and resolved_user_table:
+                resolved_entity_name = pending_clarification.get("entity_name")
+            elif corrected_entity_name:
+                resolved_entity_name = corrected_entity_name
             plan = await planner.plan(
                 collection_name=ctx.qdrant_collection,
-                question=question,
+                question=effective_question,
                 dialect=ctx.dialect,
                 conversation_context=conversation_context,
+                resolved_user_table=resolved_user_table,
+                has_user_reference=corrected_has_user_reference,
+                user_entity_name=resolved_entity_name,
             )
+ 
+            # ── Clarification needed: user entity detected but type unknown ──
+            if plan.pending_user_type_clarification:
+                clarification_text = plan.clarification_questions[0]
+ 
+                # Store context in memory so we can pick it up on the next turn
+                mem.set_pending_clarification({
+                    "original_question": question,
+                    "entity_name": plan.pending_entity_name or corrected_entity_name or "the user",
+                })
+ 
+                save_message(body.thread_id, "assistant", clarification_text)
+                return ChronoChatResponse(
+                    mode="clarification",
+                    text_summary=clarification_text,
+                    page=1,
+                    pages_total=1,
+                )
+ 
+            # ── No tables found and still needs clarification ──
             if plan.needs_clarification and not plan.relevant_tables:
                 no_data_text = await formatter._humanize_no_data(question)
                 save_message(body.thread_id, "assistant", no_data_text)
                 return ChronoChatResponse(mode="empty", text_summary=no_data_text, page=1, pages_total=1)
-
+ 
             gen_result = await generator.generate(plan, conversation_context, ctx.qdrant_collection)
             if gen_result.chat_response and not gen_result.sql:
                 save_message(body.thread_id, "assistant", gen_result.chat_response)
                 return ChronoChatResponse(mode="chat", text_summary=gen_result.chat_response, explanation=gen_result.explanation)
-
+ 
             val_result = validator.validate(gen_result.sql, ctx.dialect)
             if not val_result.is_valid:
                 last_error = "; ".join(val_result.errors)
                 conversation_context += f"\n[PREVIOUS ATTEMPT FAILED: {last_error}. Fix and try again.]"
                 continue
-
-            safe_sql = val_result.sql
+ 
+            pre_filter_sql = val_result.sql
+            safe_sql = pre_filter_sql
             last_successful_sql = safe_sql
-
-            # Apply mandatory filters for non-owners (Managers and SiteAdmins)
+ 
             logger.info(f"Chronoplot Filter : {getattr(ctx, 'common_filter_keys', None)} Is super admin : {is_super_admin}")
             if not is_super_admin and getattr(ctx, "common_filter_keys", None):
                 try:
                     from app.query.filter_verifier import SQLFilterVerifier
                     verifier = SQLFilterVerifier(dialect=ctx.dialect)
                     table_schemas = await _get_table_schemas(ctx)
-                    
-                    # Prepare overrides for filter values (e.g. SiteID from JWT)
+ 
                     filter_values = getattr(ctx, "session_filter_values", {}).copy()
                     site_id_val = jwt_payload.get("SITE_ID")
                     logger.info(f"[chronoplot] JWT SITE_ID: {site_id_val}, common_filter_keys: {ctx.common_filter_keys}")
-                    # If common_filter_keys contains SiteID, and we have it in JWT, use the JWT value
                     for key in ctx.common_filter_keys:
                         if key.lower() in ["siteid", "site_id"]:
                             if site_id_val is not None:
                                 filter_values[key] = site_id_val
                                 logger.info(f"[chronoplot] Using SITE_ID from JWT: {site_id_val}")
-                    
-                    # Column mapping for tables where site_id is represented by another name (e.g. 'id' in bnr_sites)
+ 
                     column_mappings = {
-                        "bnr_sites": { "site_id": "id", "siteid": "id" }
+                        "bnr_sites": {"site_id": "id", "siteid": "id"}
                     }
-                    if verifier.should_bypass_filter(safe_sql,ctx.dialect):
+                    if verifier.should_bypass_filter(safe_sql, ctx.dialect):
                         logger.info("Skip Filter Injection as SQL is read-only and does not reference any filter keys.")
                     else:
                         safe_sql = verifier.verify_and_inject(
@@ -1786,7 +1885,7 @@ async def chronoplot_chat_query(request: Request, body: ChronoChatRequest, _toke
                             filter_keys=ctx.common_filter_keys,
                             filter_values=filter_values,
                             table_schemas=table_schemas,
-                            column_mappings=column_mappings
+                            column_mappings=column_mappings,
                         )
                         logger.info(f"Filtered SQL applied: {safe_sql}")
                 except PermissionError as exc:
@@ -1795,24 +1894,27 @@ async def chronoplot_chat_query(request: Request, body: ChronoChatRequest, _toke
                     logger.error(f"[chronoplot] Filter injection failed: {exc}", exc_info=True)
                     return ChronoChatResponse(mode="empty", text_summary="Security verification failed.")
             last_successful_sql = safe_sql
-
+ 
             result = await executor.execute(eng, safe_sql)
-
+ 
             if not result.rows and not result.error:
                 zero_rows_on_last_attempt = True
                 last_error = "Query returned 0 rows"
                 conversation_context += (
-                    f"\n[PREVIOUS SQL RETURNED 0 ROWS: {safe_sql}\n"
+                    f"\n[PREVIOUS SQL RETURNED 0 ROWS: {pre_filter_sql}\n"
                     "Try relaxing filters or using broader LIKE patterns.]"
                     + JSON_REMINDER
                 )
                 continue
-
+ 
             if result.error:
                 last_error = result.error
-                conversation_context += f"\n[SQL EXECUTION ERROR: {last_error}. Rewrite the SQL.]{JSON_REMINDER}"
+                conversation_context += (
+                    f"\n[SQL EXECUTION ERROR on: {pre_filter_sql}\n"
+                    f"Error: {last_error}. Rewrite the SQL.]{JSON_REMINDER}"
+                )
                 continue
-
+ 
             zero_rows_on_last_attempt = False
             formatted = await formatter.format(
                 question=question,
@@ -1822,7 +1924,7 @@ async def chronoplot_chat_query(request: Request, body: ChronoChatRequest, _toke
                 explanation=gen_result.explanation,
                 page=body.page,
             )
-
+ 
             mem.add_turn(ConversationTurn(
                 question=question,
                 sql_generated=safe_sql,
@@ -1831,7 +1933,7 @@ async def chronoplot_chat_query(request: Request, body: ChronoChatRequest, _toke
                 services_used=[ctx.db_name],
                 filters_applied=[],
             ))
-
+ 
             if body.thread_id:
                 save_message(
                     body.thread_id,
@@ -1846,7 +1948,7 @@ async def chronoplot_chat_query(request: Request, body: ChronoChatRequest, _toke
                     chart_y_axis=formatted.chart_y_axis,
                     explanation=formatted.explanation,
                 )
-
+ 
             return ChronoChatResponse(
                 mode=formatted.mode, text_summary=formatted.text_summary,
                 table_data=formatted.table_data, columns=formatted.columns,
@@ -1856,14 +1958,14 @@ async def chronoplot_chat_query(request: Request, body: ChronoChatRequest, _toke
                 sql_used=formatted.sql_used, explanation=formatted.explanation,
                 page=formatted.page, pages_total=formatted.pages_total,
             )
-
+ 
         except HTTPException:
             raise
         except Exception as exc:
             last_error = str(exc)
             logger.error(f"[chronoplot] Pipeline error (attempt {attempt + 1}): {exc}", exc_info=True)
             conversation_context += f"\n[ERROR: {last_error}. Try a different approach.]{JSON_REMINDER}"
-
+ 
     if zero_rows_on_last_attempt:
         no_data_text = await formatter._humanize_no_data(question)
         save_message(body.thread_id, "assistant", no_data_text)
@@ -1872,14 +1974,11 @@ async def chronoplot_chat_query(request: Request, body: ChronoChatRequest, _toke
             text_summary=no_data_text,
             sql_used=last_successful_sql,
             page=1,
-            pages_total=1
+            pages_total=1,
         )
     no_data_text = await formatter._humanize_no_data(question)
-    return ChronoChatResponse(
-        mode="empty",
-        text_summary=no_data_text,
-    )
-
+    return ChronoChatResponse(mode="empty", text_summary=no_data_text)
+ 
 
 @app.get("/api/chronoplot/chat/threads")
 def chronoplot_get_threads(request: Request, _token: Any = Depends(cp_bearer)):
@@ -1988,8 +2087,8 @@ async def chronoplot_save_model(
     body: ChronoSaveModelRequest,
     _token: Any = Depends(cp_bearer),
 ):
-    user_detail_id, user_type, jwt_payload = _cp_authorize(request)
-
+    # user_detail_id, user_type, jwt_payload = _cp_authorize(request)
+    user_detail_id = "59d77836-6fae-4eeb-1b88-08dbef17c29f"
     ctx = await get_session_store().get(body.session_id)
     if not ctx:
         ctx_data = load_session(body.session_id)

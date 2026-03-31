@@ -181,3 +181,38 @@ class Indexer:
         if fk_info:
             parts.append(f"Joins {fk_info}")
         return " | ".join(parts)
+    
+    async def get_by_table_name(
+        self, collection_name: str, table_name: str
+    ) -> Optional[dict]:
+        """
+        Fetch a table's payload by exact table_name metadata match.
+        Much more reliable than semantic search for known table names.
+        """
+        from qdrant_client.models import Filter, FieldCondition, MatchValue
+        try:
+            results, _ = self.client.scroll(
+                collection_name=collection_name,
+                scroll_filter=Filter(
+                    must=[
+                        FieldCondition(
+                            key="table_name",
+                            match=MatchValue(value=table_name),
+                        )
+                    ]
+                ),
+                limit=1,
+                with_payload=True,
+                with_vectors=False,  # we don't need the vector, saves bandwidth
+            )
+            if results:
+                logger.info(
+                    f"[indexer] get_by_table_name: found '{table_name}' "
+                    f"with {len(results[0].payload.get('columns', []))} columns"
+                )
+                return results[0].payload
+            logger.warning(f"[indexer] get_by_table_name: '{table_name}' not found in '{collection_name}'")
+            return None
+        except Exception as e:
+            logger.error(f"[indexer] get_by_table_name failed for '{table_name}': {e}", exc_info=True)
+            return None

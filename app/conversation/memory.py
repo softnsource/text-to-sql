@@ -83,6 +83,28 @@ class ConversationMemory:
         """Clear all history."""
         self._turns.clear()
 
+    def set_pending_clarification(self, data: dict) -> None:
+        """
+        Store context needed to resolve a user-type clarification.
+    
+        data = {
+            "original_question": str,   # the question that triggered clarification
+            "entity_name": str,         # the person name detected, e.g. "Louis"
+        }
+        """
+        self._pending_clarification = data
+        logger.debug(f"[memory] Pending clarification set: {data}")
+    
+    
+    def get_pending_clarification(self) -> Optional[dict]:
+        """Return stored clarification context, or None if there isn't one."""
+        return getattr(self, "_pending_clarification", None)
+    
+    
+    def clear_pending_clarification(self) -> None:
+        """Remove the pending clarification after it has been resolved."""
+        self._pending_clarification = None
+        logger.debug("[memory] Pending clarification cleared.")
 
 # Session-based memory store (in-memory, not persisted across server restarts)
 # Each entry: {"memory": ConversationMemory, "last_accessed": float}

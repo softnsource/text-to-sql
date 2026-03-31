@@ -1046,15 +1046,18 @@ Do NOT mention "SQL", "database errors", "max retries", "internal error", or any
         return ("Data stats:\n" + "\n".join(lines)) if lines else ""
 
     def _determine_viz(self, question: str, rows: List[Dict], columns: List[str], stats: Optional[Dict] = None) -> str:
-        if len(rows) == 1 and len(columns) == 1:
-            return "number"
         q_lower = question.lower()
         wants_pie = "pie" in q_lower
         wants_chart = any(w in q_lower for w in ["chart", "graph", "plot", "visualize"])
-        logger.info(f"Want chart : {wants_chart}")
-        if (wants_chart or wants_pie) and len(rows) >= 1:
-            return "pie_chart" if wants_pie else "chart"
-        return "table"
+
+        if wants_pie:
+            return "pie_chart"
+        elif wants_chart:
+            return "chart"
+        elif len(rows) == 1 and len(columns) == 1:
+            return "number"
+        else:
+            return "table"
 
     def _paginate(self, rows: List[Dict], page: int):
         pages_total = max(1, (len(rows) + PAGE_SIZE - 1) // PAGE_SIZE)
