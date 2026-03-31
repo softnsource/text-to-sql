@@ -10,6 +10,7 @@ from app.config import get_settings
 from app.query.planner import QueryPlan, TableContext
 from app.utils.gemini_key_manager import get_key_manager
 from app.query.enrich_schema import build_enriched_schema
+from app.enums.registry import get_relevant_enums, build_enum_prompt_block
 
 logger = logging.getLogger(__name__)
 
@@ -67,90 +68,92 @@ class SQLGenerator:
         else:
             limit_syntax = f"Place LIMIT {max_rows} at the end of the query: SELECT col1, col2 ... LIMIT {max_rows}"
 
+        relevant_enums = get_relevant_enums(plan.relevant_tables)
+        enum_block = build_enum_prompt_block(relevant_enums)
+        logger.info(f"Enum block for SQL generation (length {len(enum_block)} chars): {enum_block}")
         user_entity_block = ""
         if plan.resolved_user_table and plan.user_entity_name:
             name_parts = plan.user_entity_name.strip().split()
             first_name = name_parts[0] if len(name_parts) >= 1 else plan.user_entity_name
             last_name = name_parts[-1] if len(name_parts) >= 2 else ""
             full_name = plan.user_entity_name
+            is_full_name = len(name_parts) >= 2
+
             user_entity_block = f"""
         =====================
         USER ENTITY RESOLUTION (HIGHEST PRIORITY)
         =====================
-        The user mentioned a person named "{plan.user_entity_name}".
-        This person has been identified as belonging to table: {plan.resolved_user_table}
+        The user mentioned a person: "{plan.user_entity_name}"
+        Resolved table: {plan.resolved_user_table}
+        Parsed → FirstName="{first_name}"  LastName="{last_name}"  FullName="{full_name}"
+        Is full name (first + last both present): {is_full_name}
 
-        STEP 1 — CLEAN THE NAME FIRST (MANDATORY):
-        Before building any filter, strip possessive suffixes and punctuation from the name:
-        - Remove trailing "'s", "'s", "`s", ",s" → "Louis's" becomes "Louis", "Lois's" becomes "Lois"
-        - Remove any trailing punctuation: periods, commas, apostrophes
-        - Use ONLY the cleaned name in all LIKE filters
-        - NEVER use the raw possessive form in a WHERE clause
+        ─────────────────────────────────────────
+        STEP 1 — CLEAN THE NAME (MANDATORY FIRST)
+        ─────────────────────────────────────────
+        Strip possessives and punctuation before using any name in a filter:
+        "Louis's" → "Louis"  |  "Lois's" → "Lois"  |  "Smith," → "Smith"
+        NEVER use the raw possessive form in a WHERE clause.
 
-        STEP 2 — NAME COLUMN DETECTION (MANDATORY):
-        Look at the SCHEMA columns for {plan.resolved_user_table}.
-        Build the WHERE clause using ONLY columns from this EXACT ALLOWED LIST that exist in the schema:
+        ─────────────────────────────────────────
+        STEP 2 — ALLOWED NAME COLUMNS (check schema, use ONLY if present)
+        ─────────────────────────────────────────
+        Preferred : PreferredName, Preferred_Name, KnownAs, NickName
+        First     : FirstName, First_Name, Forename, GivenName
+        Last      : LastName, Last_Name, Surname, FamilyName
+        Full      : FullName, Full_Name, DisplayName
 
-        ALLOWED name columns ONLY (check schema, use only if present):
-        - PreferredName, Preferred_Name, KnownAs, NickName        ← preferred name
-        - FirstName, First_Name, Forename, GivenName              ← first name
-        - LastName, Last_Name, Surname, FamilyName                ← last name
-        - FullName, Full_Name, DisplayName                        ← combined name
+        STRICTLY FORBIDDEN for name search (never use even if they exist):
+        Email, EmailAddress, Phone, PhoneNumber, Mobile, Username,
+        LoginName, any column containing Id/Code/Ref/Key,
+        any INT / BIT / DATE / DATETIME column.
+        ─────────────────────────────────────────
+        EMPTY VALUE GUARD (HIGHEST PRIORITY RULE)
+        ─────────────────────────────────────────
+        Before writing ANY LIKE condition, check that the value being inserted is non-empty.
 
-        STRICTLY FORBIDDEN — NEVER use these for name search, even if they exist:
-        - Email, EmailAddress, Email_Address
-        - Phone, PhoneNumber, Phone_Number, Mobile, MobileNumber, ContactNumber
-        - Username, UserName, LoginName, Login
-        - Any column containing "Id", "Code", "Ref", "Key"
-        - Any column with type INT, BIT, DATE, DATETIME
+        ⛔ NEVER generate a LIKE condition where the value is empty or blank:
+            LIKE '%%'        ← empty value — NEVER
+            LIKE '%  %'      ← whitespace only — NEVER
+            LIKE ''          ← empty string — NEVER
 
-        STEP 3 — BUILD THE FILTER using ONLY the matched ALLOWED columns:
+        ✅ RULE: If a name part (first, last, or full) is empty/blank/null,
+        SKIP every LIKE condition that would use that part entirely.
+        Do not write the condition at all.
 
-        First, split the entity name into parts:
-        - Given name "{plan.user_entity_name}", split into first="{first_name}" last="{last_name}"
-        - Full name combined = "{plan.user_entity_name}"
+        EXAMPLE — only "Vikas" given, last_name is empty:
+        ⛔ WRONG:  t1.Surname LIKE '%%'                          ← skip, last_name is empty
+        ⛔ WRONG:  t1.PreferredName LIKE '%%'                    ← skip, last_name is empty
+        ⛔ WRONG:  t1.FirstName LIKE '%Vikas%' AND t1.Surname LIKE '%%'  ← skip entire AND block
+        ✅ RIGHT:  t1.FirstName LIKE '%Vikas%'                  ← only non-empty parts used
 
-        PREFERRED NAME HANDLING (MANDATORY — highest priority):
-        If PreferredName, Preferred_Name, KnownAs, or NickName exists in the schema:
-        You MUST check ALL of these combinations using OR:
-            t1.PreferredName LIKE '%{first_name}%'        ← first name part only
-            t1.PreferredName LIKE '%{last_name}%'         ← last name part only  
-            t1.PreferredName LIKE '%{plan.user_entity_name}%'  ← full name combined
+        ─────────────────────────────────────────
+        STEP 3 — BUILD THE WHERE FILTER
+        ─────────────────────────────────────────
 
-        Example for "Vikas Kohli" where PreferredName exists:
+        ━━━ CASE A: FULL NAME GIVEN — first="{first_name}" last="{last_name}" ━━━
+
+        Column rules (strict — no exceptions):
+        • FirstName column   → LIKE '%{first_name}%'          ← first part ONLY, never last
+        • LastName column    → LIKE '%{last_name}%'           ← last part ONLY, never first
+        • PreferredName col  → check first part, last part, AND full name — all with OR
+        • FullName column    → LIKE '%{full_name}%'           ← combined only
+
+        TEMPLATE (use only columns present in schema):
+        WHERE (
+            t1.PreferredName LIKE '%{first_name}%'
+            OR t1.PreferredName LIKE '%{last_name}%'
+            OR t1.PreferredName LIKE '%{full_name}%'
+            OR (t1.FirstName LIKE '%{first_name}%' AND t1.LastName LIKE '%{last_name}%')
+            OR t1.FullName LIKE '%{full_name}%'
+        )
+
+        EXAMPLE — "Vikas Kohli", schema has PreferredName + FirstName + Surname:
         WHERE (
             t1.PreferredName LIKE '%Vikas%'
             OR t1.PreferredName LIKE '%Kohli%'
             OR t1.PreferredName LIKE '%Vikas Kohli%'
-            OR t1.FirstName LIKE '%Vikas%'
-            OR t1.LastName LIKE '%Kohli%'
-        )
-
-        THEN also add FirstName + LastName alongside PreferredName (do not skip them):
-        - ALWAYS include FirstName LIKE first_name AND LastName LIKE last_name 
-          alongside PreferredName checks using OR
-        - This ensures a match even if PreferredName is not populated for that record
-
-        FULL FILTER PRIORITY ORDER (use ALL that exist in schema, combined with OR):
-        1. PreferredName/KnownAs LIKE '%{first_name}%'
-        2. PreferredName/KnownAs LIKE '%{last_name}%'
-        3. PreferredName/KnownAs LIKE '%{full_name}%'
-        4. FirstName LIKE '%{first_name}%'
-        5. LastName LIKE '%{last_name}%'
-        6. FullName/DisplayName LIKE '%{full_name}%'
-
-        COMPLETE EXAMPLE — "Vikas Kohli", schema has PreferredName + FirstName + LastName:
-        WHERE (
-            t1.PreferredName LIKE '%Vikas%'
-            OR t1.PreferredName LIKE '%Kohli%'
-            OR t1.PreferredName LIKE '%Vikas Kohli%'
-            OR t1.FirstName LIKE '%Vikas%'
-            OR t1.LastName LIKE '%Kohli%'
-        )
-
-        EXAMPLE — "Vikas Kohli", schema has ONLY FullName (no PreferredName, no First/Last):
-        WHERE (
-            t1.FullName LIKE '%Vikas Kohli%'
+            OR (t1.FirstName LIKE '%Vikas%' AND t1.Surname LIKE '%Kohli%')
         )
 
         EXAMPLE — "Vikas Kohli", schema has PreferredName + FullName (no First/Last):
@@ -159,18 +162,66 @@ class SQLGenerator:
             OR t1.PreferredName LIKE '%Kohli%'
             OR t1.PreferredName LIKE '%Vikas Kohli%'
             OR t1.FullName LIKE '%Vikas Kohli%'
-        ) 
+        )
 
-        STRICT RULES:
-        - NEVER filter on Email or Phone number columns when resolving user entities. These are not name fields and can lead to false positives. Only use the allowed name-like columns specified above.
-        - NEVER filter on a name column that is NOT listed in the SCHEMA for {plan.resolved_user_table}
-        - NEVER invent columns like "Name", "UserName" if they don\_t exist in SCHEMA
-        - NEVER use the possessive form (Louis\_s) in LIKE — always use the cleaned name (Louis)
-        - Always use OR between name columns, never AND
-        - JOIN from {plan.resolved_user_table} to other relevant tables using FK relationships in SCHEMA
-        - NEVER use a different user/person table for this entity
-        - DO NOT USE Email and Phone number columns for user entity resolution. These are not name fields and can lead to false positives. Only use the allowed name-like columns specified above.
-        - Do not use email and phone number when first name last name or full name given 
+        EXAMPLE — "Vikas Kohli", schema has ONLY FirstName + Surname (no PreferredName, no FullName):
+        WHERE (
+            t1.FirstName LIKE '%Vikas%' AND t1.Surname LIKE '%Kohli%'
+        )
+
+        EXAMPLE — "Vikas Kohli", schema has ONLY FullName:
+        WHERE (
+            t1.FullName LIKE '%Vikas Kohli%'
+        )
+
+        ⛔ FORBIDDEN patterns when full name given:
+            t1.FirstName  LIKE '%Kohli%'                              ← last name in FirstName — NEVER
+            t1.Surname    LIKE '%Vikas%'                              ← first name in Surname — NEVER
+            t1.FirstName  LIKE '%Vikas%' OR t1.Surname LIKE '%Vikas%' ← mixing parts across columns — NEVER
+
+        ━━━ CASE B: SINGLE NAME ONLY — one word="{first_name}" ━━━
+
+        Rule: We don't know if it's first or last, so check ALL name columns with OR,
+            using the SAME single word for every column.
+
+        TEMPLATE (use only columns present in schema):
+        WHERE (
+            t1.PreferredName LIKE '%{first_name}%'
+            OR t1.FirstName  LIKE '%{first_name}%'
+            OR t1.LastName   LIKE '%{first_name}%'
+            OR t1.FullName   LIKE '%{first_name}%'
+        )
+
+        EXAMPLE — "Vikas", schema has PreferredName + FirstName + Surname:
+        WHERE (
+            t1.PreferredName LIKE '%Vikas%'
+            OR t1.FirstName  LIKE '%Vikas%'
+            OR t1.Surname    LIKE '%Vikas%'
+        )
+
+        EXAMPLE — "Vikas", schema has ONLY FirstName + Surname (no PreferredName):
+        WHERE (
+            t1.FirstName LIKE '%Vikas%'
+            OR t1.Surname LIKE '%Vikas%'
+        )
+
+        ⛔ FORBIDDEN patterns for single name:
+            t1.FirstName LIKE '%Vikas%' AND t1.Surname LIKE '%Vikas%'  ← AND between columns — NEVER
+            Checking first_name in LastName AND first_name in FirstName with AND — NEVER
+
+        ─────────────────────────────────────────
+        HARD RULES (never violate)
+        ─────────────────────────────────────────
+        1. FULL NAME → FirstName column = first part ONLY. LastName column = last part ONLY.
+        2. FULL NAME → PreferredName checks all parts (first, last, combined) with OR.
+        3. SINGLE NAME → every name column gets the same single word, all joined with OR.
+        4. PreferredName is ONLY included if it exists in the schema for {plan.resolved_user_table}.
+        5. NEVER use Email, Phone, or any forbidden column for name resolution.
+        6. NEVER use columns not present in the schema for {plan.resolved_user_table}.
+        7. NEVER invent columns (e.g. "Name", "UserName") that don't exist in the schema.
+        8. NEVER use the possessive form in a LIKE filter.
+        9. JOIN from {plan.resolved_user_table} to other tables using FK relationships in the schema.
+        10. NEVER use a different user/person table for this entity.
         """
 
         prompt = f"""
@@ -192,7 +243,12 @@ class SQLGenerator:
             USER QUESTION
             =====================
             {plan.question}
-            
+
+            =====================
+            ENUM 
+            =====================
+            {enum_block}
+
             =====================
             INTENT DETECTION (CHECK THIS FIRST)
             =====================
@@ -267,6 +323,55 @@ class SQLGenerator:
             - Never produce a UNION where branch column counts differ.
             - Always use UNION ALL (not UNION) unless deduplication is explicitly needed.
             
+            =====================
+            SOFT DELETE RULE (CRITICAL)
+            =====================
+
+            Many tables include a soft delete column named "IsDeleted".
+
+            RULES:
+            - If the table being queried contains a column named "IsDeleted":
+                → ALWAYS add a filter: IsDeleted = 0
+
+            - This condition MUST be applied:
+                - In the main table (FROM)
+                - AND in ALL joined tables that contain IsDeleted
+
+            - Use proper aliasing:
+                Example:
+                    WHERE t1.IsDeleted = 0
+                    AND t2.IsDeleted = 0
+
+            - NEVER include IsDeleted in the SELECT clause.
+
+            - Treat IsDeleted as BOOLEAN:
+                - ALWAYS use = 0 or = 1
+                - NEVER use LIKE
+
+            - If a WHERE clause already exists:
+                → append using AND
+
+            - If no WHERE clause exists:
+                → create one with IsDeleted = 0
+
+            EXAMPLES:
+
+            GOOD:
+            SELECT t1.Name
+            FROM Users t1
+            WHERE t1.IsDeleted = 0
+
+            GOOD (with JOIN):
+            SELECT t1.Name, t2.RoleName
+            FROM Users t1
+            JOIN Roles t2 ON t1.RoleId = t2.Id
+            WHERE t1.IsDeleted = 0
+            AND t2.IsDeleted = 0
+
+            BAD:
+            WHERE t1.IsDeleted LIKE '%false%'   ❌
+            SELECT t1.IsDeleted                 ❌
+
             =====================
             ANTI-HALLUCINATION RULE (HIGHEST PRIORITY)
             =====================

@@ -22,12 +22,12 @@ logger = logging.getLogger(__name__)
 USER_TYPE_OPTIONS = [
     {
         "label": "Service User",
-        "table": "BNR_ServiceUser",
+        "table": "BNR_Service_User",
         "keywords": ["service user", "service client", "client", "service"],
     },
     {
         "label": "Staff",
-        "table": "BNR_UserDetails",
+        "table": "BNR_User_Details",
         "keywords": ["staff", "operator", "support staff", "manager", "employee", "personnel"],
     },
     {
@@ -41,7 +41,121 @@ USER_TYPE_OPTIONS = [
         "keywords": ["other", "not sure", "unknown", "don't know", "unsure", "general"],
     },
 ]
+# ---------------------------------------------------------------------------
+# Data classes
+# ---------------------------------------------------------------------------
+@dataclass
+class TableContext:
+    """Lightweight table reference returned from planner."""
+    table_name: str
+    schema_name: Optional[str]
+    dialect: str
+    description: str
+    columns: List[Dict]
+    foreign_keys: List[Dict]
+    row_count: int
+    sample_rows: List[Dict] = field(default_factory=list)
+    reverse_foreign_keys: List[Dict] = field(default_factory=list)
 
+@dataclass
+class QueryPlan:
+    question: str
+    confidence: float
+    needs_clarification: bool
+    clarification_questions: List[str]
+    relevant_tables: List[TableContext]
+    dialect: str
+    # Set when we need the user to clarify which user type a named person belongs to
+    pending_user_type_clarification: bool = False
+    # The name we detected (e.g. "Louis") — passed back so the API can store it
+    pending_entity_name: Optional[str] = None
+    resolved_user_table: Optional[str] = None
+    user_entity_name: Optional[str] = None
+    pending_user_type_options: List[Dict] = field(default_factory=list)
+    
+def _normalize_table_name(name: str) -> str:
+    """Remove underscores and lowercase for fuzzy matching."""
+    return name.lower().replace("_", "")
+
+
+def get_user_type_tables_in_candidates(
+    candidate_tables: List[TableContext],
+) -> List[Dict]:
+    """
+    Returns only the USER_TYPE_OPTIONS entries whose canonical table
+    actually appeared in the Qdrant candidate list.
+    Normalized comparison: case-insensitive + underscore-agnostic.
+    """
+    # Normalize all candidate names once
+    candidate_normalized = {
+        _normalize_table_name(t.table_name): t.table_name  # normalized → original
+        for t in candidate_tables
+    }
+
+    matched = []
+    for option in USER_TYPE_OPTIONS:
+        if option["table"]:
+            normalized_option = _normalize_table_name(option["table"])
+            if normalized_option in candidate_normalized:
+                # ✅ Store the ACTUAL table name from Qdrant (not the one in USER_TYPE_OPTIONS)
+                # so resolved_user_table always matches exactly what's in the DB
+                matched.append({
+                    **option,
+                    "table": candidate_normalized[normalized_option],  # use real name
+                })
+    return matched
+
+
+
+async def build_multi_table_clarification_text(
+    question: str,
+    matched_options: List[Dict],
+) -> str:
+    """
+    Dynamically generates a clarification message when multiple user-type
+    tables are found. Options list is built from actual Qdrant results.
+    """
+    options_text = "\n".join(
+        f"{i + 1}. {opt['label']}" for i, opt in enumerate(matched_options)
+    )
+
+    prompt = f"""
+You are a helpful database assistant.
+
+A user asked: "{question}"
+
+The question could relate to multiple types of users in the system.
+You need to ask which type of user data they are referring to.
+
+Available user types found:
+{options_text}
+
+Guidelines:
+- Be conversational and concise
+- Reference the user types by their label names
+- Do NOT mention table names or technical details
+- Ask clearly which type of data they want to look at
+
+Return ONLY the final message to the user.
+"""
+
+    try:
+        response = await get_key_manager().generate_content(
+            prompt,
+            generation_config=genai.GenerationConfig(
+                temperature=0.7,
+                max_output_tokens=150,
+            ),
+        )
+        return response.text.strip()
+
+    except Exception as e:
+        logger.warning(f"LLM multi-table clarification failed: {e}")
+        labels = ", ".join(f"'{o['label']}'" for o in matched_options)
+        return (
+            f"Your question could relate to different types of users. "
+            f"Could you clarify whether you mean: {labels}?"
+        )
 
 def resolve_user_type_table(user_type_answer: str) -> Optional[str]:
     answer_lower = user_type_answer.lower()
@@ -101,38 +215,6 @@ Return ONLY the final message.
         return await build_user_type_clarification_text(entity_name)
 
 
-# ---------------------------------------------------------------------------
-# Data classes
-# ---------------------------------------------------------------------------
-
-@dataclass
-class TableContext:
-    """Lightweight table reference returned from planner."""
-    table_name: str
-    schema_name: Optional[str]
-    dialect: str
-    description: str
-    columns: List[Dict]
-    foreign_keys: List[Dict]
-    row_count: int
-    sample_rows: List[Dict] = field(default_factory=list)
-    reverse_foreign_keys: List[Dict] = field(default_factory=list)
-
-
-@dataclass
-class QueryPlan:
-    question: str
-    confidence: float
-    needs_clarification: bool
-    clarification_questions: List[str]
-    relevant_tables: List[TableContext]
-    dialect: str
-    # Set when we need the user to clarify which user type a named person belongs to
-    pending_user_type_clarification: bool = False
-    # The name we detected (e.g. "Louis") — passed back so the API can store it
-    pending_entity_name: Optional[str] = None
-    resolved_user_table: Optional[str] = None
-    user_entity_name: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -236,6 +318,43 @@ class QueryPlanner:
             )
 
         candidate_tables = [self._payload_to_context(p) for p in raw_results]
+
+        if not effective_resolved_table and not user_opted_out:
+            matched_user_options = get_user_type_tables_in_candidates(candidate_tables)
+            logger.info(f"[planner] Matched user-type tables in candidates: {matched_user_options}")
+            if len(matched_user_options) > 1:
+                logger.info(
+                    f"[planner] Multiple user-type tables found in candidates "
+                    f"({[o['table'] for o in matched_user_options]}) — "
+                    "returning multi-table clarification plan."
+                )
+                clarification_msg = await build_multi_table_clarification_text(
+                    question, matched_user_options
+                )
+                return QueryPlan(
+                    question=question,
+                    confidence=0.0,
+                    needs_clarification=True,
+                    clarification_questions=[clarification_msg],
+                    relevant_tables=[],
+                    dialect=dialect,
+                    pending_user_type_clarification=True,
+                    # No entity name — this is a table-ambiguity clarification
+                    pending_entity_name=None,
+                    # Only the matched options — not the full static list
+                    pending_user_type_options=matched_user_options,
+                )
+
+            elif len(matched_user_options) == 1:
+                # Only one user table found — auto-resolve, no need to ask
+                auto_table = matched_user_options[0]["table"]
+                logger.info(
+                    f"[planner] Single user-type table '{auto_table}' auto-resolved from candidates."
+                )
+                effective_resolved_table = auto_table
+                effective_question = (
+                    f"{question} [user table to use: {auto_table}]"
+                )
 
         # ------------------------------------------------------------------
         # 4. If resolved_user_table isn't already in candidates, add a stub
