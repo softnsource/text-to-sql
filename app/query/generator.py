@@ -69,6 +69,10 @@ class SQLGenerator:
 
         user_entity_block = ""
         if plan.resolved_user_table and plan.user_entity_name:
+            name_parts = plan.user_entity_name.strip().split()
+            first_name = name_parts[0] if len(name_parts) >= 1 else plan.user_entity_name
+            last_name = name_parts[-1] if len(name_parts) >= 2 else ""
+            full_name = plan.user_entity_name
             user_entity_block = f"""
         =====================
         USER ENTITY RESOLUTION (HIGHEST PRIORITY)
@@ -101,31 +105,61 @@ class SQLGenerator:
         - Any column with type INT, BIT, DATE, DATETIME
 
         STEP 3 — BUILD THE FILTER using ONLY the matched ALLOWED columns:
-        When an entity name is provided:
-        - ALWAYS prioritize filtering by PreferredName, Preferred_Name, KnownAs, NickName if they exist in the schema.
-        - If preferred name columns are not present, then use FirstName, First_Name, Forename, GivenName AND LastName, Last_Name, Surname, FamilyName if both first and last name components of the user entity can be identified.
-        - If neither preferred name nor distinct first/last name columns are suitable, use FullName, Full_Name, DisplayName.
-        - NEVER compare email or phone number columns with the entity name.
-        - The model should infer first and last names from the user_entity_name (e.g., "Hardik Pandya" → "Hardik" for first name, "Pandya" for last name) and use them for filtering respective columns if they exist.
 
-        Combine found columns with OR:
+        First, split the entity name into parts:
+        - Given name "{plan.user_entity_name}", split into first="{first_name}" last="{last_name}"
+        - Full name combined = "{plan.user_entity_name}"
 
-        GOOD:
+        PREFERRED NAME HANDLING (MANDATORY — highest priority):
+        If PreferredName, Preferred_Name, KnownAs, or NickName exists in the schema:
+        You MUST check ALL of these combinations using OR:
+            t1.PreferredName LIKE '%{first_name}%'        ← first name part only
+            t1.PreferredName LIKE '%{last_name}%'         ← last name part only  
+            t1.PreferredName LIKE '%{plan.user_entity_name}%'  ← full name combined
+
+        Example for "Vikas Kohli" where PreferredName exists:
         WHERE (
-            t1.FirstName LIKE 
-            OR t1.LastName LIKE 
-            OR t1.PreferredName LIKE 
+            t1.PreferredName LIKE '%Vikas%'
+            OR t1.PreferredName LIKE '%Kohli%'
+            OR t1.PreferredName LIKE '%Vikas Kohli%'
+            OR t1.FirstName LIKE '%Vikas%'
+            OR t1.LastName LIKE '%Kohli%'
         )
 
-        BAD — NEVER do this:
+        THEN also add FirstName + LastName alongside PreferredName (do not skip them):
+        - ALWAYS include FirstName LIKE first_name AND LastName LIKE last_name 
+          alongside PreferredName checks using OR
+        - This ensures a match even if PreferredName is not populated for that record
+
+        FULL FILTER PRIORITY ORDER (use ALL that exist in schema, combined with OR):
+        1. PreferredName/KnownAs LIKE '%{first_name}%'
+        2. PreferredName/KnownAs LIKE '%{last_name}%'
+        3. PreferredName/KnownAs LIKE '%{full_name}%'
+        4. FirstName LIKE '%{first_name}%'
+        5. LastName LIKE '%{last_name}%'
+        6. FullName/DisplayName LIKE '%{full_name}%'
+
+        COMPLETE EXAMPLE — "Vikas Kohli", schema has PreferredName + FirstName + LastName:
         WHERE (
-            t1.FirstName LIKE 
-            OR t1.Email LIKE 
-            OR t1.Phone LIKE 
+            t1.PreferredName LIKE '%Vikas%'
+            OR t1.PreferredName LIKE '%Kohli%'
+            OR t1.PreferredName LIKE '%Vikas Kohli%'
+            OR t1.FirstName LIKE '%Vikas%'
+            OR t1.LastName LIKE '%Kohli%'
         )
 
-        Example — if only FullName exists:
-        WHERE t1.FullName LIKE 
+        EXAMPLE — "Vikas Kohli", schema has ONLY FullName (no PreferredName, no First/Last):
+        WHERE (
+            t1.FullName LIKE '%Vikas Kohli%'
+        )
+
+        EXAMPLE — "Vikas Kohli", schema has PreferredName + FullName (no First/Last):
+        WHERE (
+            t1.PreferredName LIKE '%Vikas%'
+            OR t1.PreferredName LIKE '%Kohli%'
+            OR t1.PreferredName LIKE '%Vikas Kohli%'
+            OR t1.FullName LIKE '%Vikas Kohli%'
+        ) 
 
         STRICT RULES:
         - NEVER filter on Email or Phone number columns when resolving user entities. These are not name fields and can lead to false positives. Only use the allowed name-like columns specified above.
