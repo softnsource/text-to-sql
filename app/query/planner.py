@@ -433,12 +433,12 @@ class QueryPlanner:
         # 2. Enrich the question with the resolved user table hint (if any)
         # ------------------------------------------------------------------
         effective_question = question
-        if resolved_user_table:
+        if effective_resolved_table:
             effective_question = (
-                f"{question} [user table to use: {resolved_user_table}]"
+                f"{question} [user table to use: {effective_resolved_table}]"
             )
             logger.info(
-                f"[planner] Injecting resolved user table '{resolved_user_table}' into question."
+                f"[planner] Injecting resolved user table '{effective_resolved_table}' into question."
             )
 
         # ------------------------------------------------------------------
@@ -476,32 +476,32 @@ class QueryPlanner:
         # 4. If resolved_user_table isn't already in candidates, add a stub
         #    so Gemini can see and select it.
         # ------------------------------------------------------------------
-        if resolved_user_table:
+        if effective_resolved_table:
             candidate_names = {t.table_name.lower() for t in candidate_tables}
-            if resolved_user_table.lower() not in candidate_names:
+            if effective_resolved_table.lower() not in candidate_names:
                 logger.info(
-                    f"[planner] '{resolved_user_table}' not in top-{top_k}; "
+                    f"[planner] '{effective_resolved_table}' not in top-{top_k}; "
                     "fetching by exact metadata match."
                 )
                 payload = await self.indexer.get_by_table_name(
-                    collection_name, resolved_user_table
+                    collection_name, effective_resolved_table
                 )
                 if payload:
                     real_table = self._payload_to_context(payload)
                     candidate_tables.append(real_table)
                     logger.info(
-                        f"[planner] Appended '{resolved_user_table}' with "
+                        f"[planner] Appended '{effective_resolved_table}' with "
                         f"{len(real_table.columns)} columns to candidates."
                     )
                 else:
                     # Rare: table genuinely missing from index
                     logger.warning(
-                        f"[planner] '{resolved_user_table}' not found in Qdrant — "
+                        f"[planner] '{effective_resolved_table}' not found in Qdrant — "
                         "inserting empty stub. Generator may hallucinate columns."
                     )
                     candidate_tables.append(
                         TableContext(
-                            table_name=resolved_user_table,
+                            table_name=effective_resolved_table,
                             schema_name=None,
                             dialect=dialect,
                             description=f"Resolved user table for: {question}",
@@ -525,8 +525,8 @@ class QueryPlanner:
         selected_names = {n.lower() for n in analysis.get("relevant_tables", [])}
 
         # Always honour the resolved user table even if Gemini missed it
-        if resolved_user_table:
-            selected_names.add(resolved_user_table.lower())
+        if effective_resolved_table:
+            selected_names.add(effective_resolved_table.lower())
 
         if selected_names:
             relevant = [

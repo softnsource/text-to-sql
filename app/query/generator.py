@@ -136,7 +136,7 @@ class SQLGenerator:
         - JOIN from {plan.resolved_user_table} to other relevant tables using FK relationships in SCHEMA
         - NEVER use a different user/person table for this entity
         - DO NOT USE Email and Phone number columns for user entity resolution. These are not name fields and can lead to false positives. Only use the allowed name-like columns specified above.
-        
+        - Do not use email and phone number when first name last name or full name given 
         """
 
         prompt = f"""
