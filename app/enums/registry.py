@@ -47,7 +47,7 @@ ENUM_REGISTRY: dict[str, dict[str, dict[str, Any]]] = {
     },
  
     # ── BNR_UserDetails (Staff) ──────────────────────────────────────────────
-    "BNR_UserDetails": {
+    "BNR_User_Details": {
         "UserType": {
             "db_type": "int",
             "synonyms": {
@@ -1658,6 +1658,19 @@ def build_enum_prompt_block(relevant_enums: dict) -> str:
         "- ALWAYS write WHERE Status = 1              ← integer value — CORRECT",
         "- If user's word has no match in the map above, skip that filter entirely",
         "- NEVER generate a filter with an empty or guessed value",
+        "",
+        "⛔ CRITICAL — ENUM COLUMNS ARE NOT FOREIGN KEYS:",
+        "- NEVER use an enum column in a JOIN condition",
+        "- Example: PersonAffected stores 1=Service User, 2=Staff — it is NOT a FK to any person table",
+        "- WRONG: JOIN BNR_Service_User t2 ON t1.PersonAffected = t2.Id",
+        "- RIGHT:  WHERE t1.PersonAffected = 1  (use as a WHERE filter only)",
+        "",
+        "COMBINING ENUM FILTER WITH PERSON NAME FILTER:",
+        "- If the user mentions a person type (e.g. 'service user') AND a person name (e.g. 'Vikas Kohli'):",
+        "  Step 1 → Add enum WHERE filter: WHERE t1.PersonAffected = 1",
+        "  Step 2 → JOIN the resolved person table using the ACTUAL FK column from schema",
+        "  Step 3 → Add name filter on the joined table: AND t2.FirstName LIKE '%Vikas%'",
+        "- The enum filter and the name JOIN are two separate things — never confuse them",
         "=====================",
     ]
  

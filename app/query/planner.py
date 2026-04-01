@@ -87,10 +87,12 @@ def get_user_type_tables_in_candidates(
     Normalized comparison: case-insensitive + underscore-agnostic.
     """
     # Normalize all candidate names once
+    logger.info(f"Candidate tables : {candidate_tables}")
     candidate_normalized = {
         _normalize_table_name(t.table_name): t.table_name  # normalized → original
         for t in candidate_tables
     }
+    logger.info(f"Candidate normalized : {candidate_normalized}")
 
     matched = []
     for option in USER_TYPE_OPTIONS:
@@ -104,7 +106,6 @@ def get_user_type_tables_in_candidates(
                     "table": candidate_normalized[normalized_option],  # use real name
                 })
     return matched
-
 
 
 async def build_multi_table_clarification_text(
@@ -253,40 +254,34 @@ class QueryPlanner:
           question so Qdrant and Gemini both target the right table.
         """
 
-        # ------------------------------------------------------------------
-        # 1. User-entity clarification gate
-        # ------------------------------------------------------------------
+        # # ------------------------------------------------------------------
+        # # 1. User-entity clarification gate
+        # # ------------------------------------------------------------------
+        # No name-based clarification gate — proceed directly
         user_opted_out = resolved_user_table == "__skip__"
         effective_resolved_table = None if user_opted_out else resolved_user_table
-
-        if has_user_reference and not effective_resolved_table and not user_opted_out:
-            entity_name = user_entity_name or "the person"
-            logger.info(
-                f"[planner] User entity '{entity_name}' detected but type unresolved — "
-                "returning clarification plan."
-            )
-            return QueryPlan(
-                question=question,
-                confidence=0.0,
-                needs_clarification=True,
-                clarification_questions=[await build_user_type_clarification_text(entity_name)],
-                relevant_tables=[],
-                dialect=dialect,
-                pending_user_type_clarification=True,
-                pending_entity_name=entity_name,
-            )
+        logger.info(f"effective_resolved_table: {effective_resolved_table}")
+        # if has_user_reference and not effective_resolved_table and not user_opted_out:
+        #     entity_name = user_entity_name or "the person"
+        #     return QueryPlan(
+        #         question=question,
+        #         confidence=0.0,
+        #         needs_clarification=True,
+        #         clarification_questions=[await build_user_type_clarification_text(entity_name)],
+        #         relevant_tables=[],
+        #         dialect=dialect,
+        #         pending_user_type_clarification=True,
+        #         pending_entity_name=entity_name,
+        #     )
 
         # ------------------------------------------------------------------
         # 2. Enrich the question with the resolved user table hint (if any)
         # ------------------------------------------------------------------
         effective_question = question
-        if effective_resolved_table:
-            effective_question = (
-                f"{question} [user table to use: {effective_resolved_table}]"
-            )
-            logger.info(
-                f"[planner] Injecting resolved user table '{effective_resolved_table}' into question."
-            )
+        # if effective_resolved_table:
+        #     effective_question = (
+        #         f"{question} [include table: {effective_resolved_table}]"
+        #     )
 
         # ------------------------------------------------------------------
         # 3. Semantic search in Qdrant
@@ -319,95 +314,76 @@ class QueryPlanner:
 
         candidate_tables = [self._payload_to_context(p) for p in raw_results]
 
-        if not effective_resolved_table and not user_opted_out:
-            matched_user_options = get_user_type_tables_in_candidates(candidate_tables)
-            logger.info(f"[planner] Matched user-type tables in candidates: {matched_user_options}")
-            if len(matched_user_options) > 1:
-                logger.info(
-                    f"[planner] Multiple user-type tables found in candidates "
-                    f"({[o['table'] for o in matched_user_options]}) — "
-                    "returning multi-table clarification plan."
-                )
-                clarification_msg = await build_multi_table_clarification_text(
-                    question, matched_user_options
-                )
-                return QueryPlan(
-                    question=question,
-                    confidence=0.0,
-                    needs_clarification=True,
-                    clarification_questions=[clarification_msg],
-                    relevant_tables=[],
-                    dialect=dialect,
-                    pending_user_type_clarification=True,
-                    # No entity name — this is a table-ambiguity clarification
-                    pending_entity_name=None,
-                    # Only the matched options — not the full static list
-                    pending_user_type_options=matched_user_options,
-                )
+        # if not effective_resolved_table and not user_opted_out:
+        # matched_user_options = get_user_type_tables_in_candidates(candidate_tables)
+        # logger.info(f"Matched User options : {matched_user_options}")
+        # if len(matched_user_options) > 1:
+        #     clarification_msg = await build_multi_table_clarification_text(
+        #         question, matched_user_options
+        #     )
+        #     return QueryPlan(
+        #         question=question,
+        #         confidence=0.0,
+        #         needs_clarification=True,
+        #         clarification_questions=[clarification_msg],
+        #         relevant_tables=[],
+        #         dialect=dialect,
+        #         pending_user_type_clarification=True,
+        #         # No entity name — this is a table-ambiguity clarification
+        #         pending_entity_name=None,
+        #         # Only the matched options — not the full static list
+        #         pending_user_type_options=matched_user_options,
+        #     )
 
-            elif len(matched_user_options) == 1:
-                # Only one user table found — auto-resolve, no need to ask
-                auto_table = matched_user_options[0]["table"]
-                logger.info(
-                    f"[planner] Single user-type table '{auto_table}' auto-resolved from candidates."
-                )
-                effective_resolved_table = auto_table
-                effective_question = (
-                    f"{question} [user table to use: {auto_table}]"
-                )
+        # elif len(matched_user_options) == 1:
+        #     # Only one user table found — auto-resolve, no need to ask
+        #     auto_table = matched_user_options[0]["table"]
+        #     effective_resolved_table = auto_table
+        #     effective_question = (
+        #         f"{question} [user table to use: {auto_table}]"
+        #     )
 
-        # ------------------------------------------------------------------
-        # 4. If resolved_user_table isn't already in candidates, add a stub
-        #    so Gemini can see and select it.
-        # ------------------------------------------------------------------
-        if effective_resolved_table:
-            candidate_names = {t.table_name.lower() for t in candidate_tables}
-            if effective_resolved_table.lower() not in candidate_names:
-                logger.info(
-                    f"[planner] '{effective_resolved_table}' not in top-{top_k}; "
-                    "fetching by exact metadata match."
-                )
-                payload = await self.indexer.get_by_table_name(
-                    collection_name, effective_resolved_table
-                )
-                if payload:
-                    real_table = self._payload_to_context(payload)
-                    candidate_tables.append(real_table)
-                    logger.info(
-                        f"[planner] Appended '{effective_resolved_table}' with "
-                        f"{len(real_table.columns)} columns to candidates."
-                    )
-                else:
-                    # Rare: table genuinely missing from index
-                    logger.warning(
-                        f"[planner] '{effective_resolved_table}' not found in Qdrant — "
-                        "inserting empty stub. Generator may hallucinate columns."
-                    )
-                    candidate_tables.append(
-                        TableContext(
-                            table_name=effective_resolved_table,
-                            schema_name=None,
-                            dialect=dialect,
-                            description=f"Resolved user table for: {question}",
-                            columns=[],
-                            foreign_keys=[],
-                            row_count=0,
-                        )
-                    )
+        # # ------------------------------------------------------------------
+        # # 4. If resolved_user_table isn't already in candidates, add a stub
+        # #    so Gemini can see and select it.
+        # # ------------------------------------------------------------------
+        # if effective_resolved_table:
+        #     # Use normalized comparison — handles underscore/case mismatches
+        #     resolved_normalized = _normalize_table_name(effective_resolved_table)
+        #     candidate_names_normalized = {
+        #         _normalize_table_name(t.table_name) for t in candidate_tables
+        #     }
+
+        #     if resolved_normalized not in candidate_names_normalized:
+        #         # Table genuinely not in candidates — fetch from Qdrant
+        #         payload = await self.indexer.get_by_table_name(
+        #             collection_name, effective_resolved_table
+        #         )
+        #         if payload:
+        #             real_table = self._payload_to_context(payload)
+        #             candidate_tables.append(real_table)
+        #         else:
+        #             logger.warning(
+        #                 f"[planner] '{effective_resolved_table}' not found in Qdrant either — skipping stub."
+        #             )
+        #             # ← DO NOT add empty stub — it confuses Gemini more than helps
+        #     else:
+        #         logger.info(
+        #             f"[planner] '{effective_resolved_table}' already in candidates — skipping fetch."
+        #         )
 
 
         # ------------------------------------------------------------------
         # 5. Ask Gemini which candidates are actually needed
         # ------------------------------------------------------------------
         schema_context = self._build_schema_context(candidate_tables)
-        logger.info(f"[planner] Schema context for Gemini:\n{schema_context}")
 
         analysis = await self._analyze_with_gemini(
             effective_question, schema_context, conversation_context
         )
 
         selected_names = {n.lower() for n in analysis.get("relevant_tables", [])}
-
+        logger.info(f"Selected Name : {selected_names}")
         # Always honour the resolved user table even if Gemini missed it
         if effective_resolved_table:
             selected_names.add(effective_resolved_table.lower())

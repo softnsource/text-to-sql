@@ -15,7 +15,7 @@ DIALECT_MAP = {
 
 # Tables that should never be checked directly for site_id filter
 # but their reverse_foreign_keys (parents) are still traversed
-SITE_FILTER_SKIP_TABLES = {"bnr_userdetails", "bnr_abcform"}
+SITE_FILTER_SKIP_TABLES = {"bnr_user_details", "bnr_abcform"}
 FILTER_BYPASS_TABLES = {
     "bnr_course",
     "bnr_questions",
@@ -130,10 +130,68 @@ class SQLFilterVerifier:
             except Exception as e:
                 logger.error(f"Failed to inject filter '{cond_str}': {e}")
 
+        expression = self._inject_soft_delete_filters(
+            expression, tables_in_query, table_schemas
+        )
         result_sql = expression.sql(dialect=DIALECT_MAP.get(self.dialect.lower(), "postgres"))
         logger.info(f"Final filtered SQL: {result_sql}")
         return result_sql
 
+    # ──────────────────────────────────────────────────────────────────────
+    # SOFT DELETE FILTER INJECTION
+    # ──────────────────────────────────────────────────────────────────────
+    def _inject_soft_delete_filters(
+        self,
+        expression,
+        tables_in_query: List[Dict],
+        table_schemas: Dict[str, Any],
+    ) -> any:
+        """
+        For every table in the query, if it has an 'IsDeleted' column,
+        inject: alias.IsDeleted = 0
+        """
+        for table_info in tables_in_query:
+            t_name  = table_info["name"]
+            t_alias = table_info["alias"]
+
+            schema = self._get_schema_payload(t_name, table_schemas)
+            if schema is None:
+                logger.debug(f"[soft-delete] No schema for '{t_name}', skipping.")
+                continue
+
+            # Get column list
+            if isinstance(schema, dict):
+                col_list = [
+                    c["name"] if isinstance(c, dict) else c
+                    for c in schema.get("columns", [])
+                ]
+            elif isinstance(schema, list):
+                col_list = schema
+            else:
+                continue
+
+            # Case-insensitive check for IsDeleted
+            is_deleted_col = next(
+                (c for c in col_list if c.lower() == "isdeleted"),
+                None
+            )
+
+            if is_deleted_col:
+                condition_str = f"{t_alias}.{is_deleted_col} = 0"
+                try:
+                    cond_expr = parse_one(condition_str)
+                    expression = expression.where(cond_expr, copy=False)
+                    logger.info(
+                        f"[soft-delete] Injected '{condition_str}' for table '{t_name}'"
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"[soft-delete] Failed to inject for '{t_name}': {e}"
+                    )
+            else:
+                logger.debug(f"[soft-delete] '{t_name}' has no IsDeleted column, skipping.")
+
+        return expression
     # ──────────────────────────────────────────────────────────────────────
     # PASS 1 — check tables already present in the query
     # ──────────────────────────────────────────────────────────────────────
@@ -348,7 +406,11 @@ class SQLFilterVerifier:
         normalized_key = filter_key.replace("_", "").lower()
         if normalized_key != "siteid":
             return False
-        return table_name.lower() in SITE_FILTER_SKIP_TABLES
+        return table_name.replace("_", "").replace(" ", "").lower() in {
+            t.replace("_", "").replace(" ", "").lower() 
+            for t in SITE_FILTER_SKIP_TABLES
+        }
+
 
     def _get_schema_payload(
         self, table_name: str, table_schemas: Dict[str, Any]

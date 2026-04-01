@@ -1673,18 +1673,6 @@ async def chronoplot_chat_query(request: Request, body: ChronoChatRequest, _toke
     NL → SQL → response pipeline.
     Requires Authorization: Bearer <jwt> with UserType SuperAdmin(2) or Manager(4).
  
-    User-type clarification flow
-    ----------------------------
-    Turn 1: User asks "Give me a breakdown of Louis incidents for the last 2 years"
-            → corrector detects "Louis" is a person reference
-            → planner returns pending_user_type_clarification=True
-            → API returns mode="clarification" with options and stores
-              {original_question, entity_name} in memory under thread_id
- 
-    Turn 2: User replies "Staff member"
-            → API detects pending clarification in memory
-            → resolves table = BNR_UserDetails
-            → re-runs full pipeline with enriched original question
     """
     user_detail_id, user_type, jwt_payload = _cp_authorize(request)
     last_successful_sql = ""
@@ -1730,31 +1718,19 @@ async def chronoplot_chat_query(request: Request, body: ChronoChatRequest, _toke
     pending_clarification = mem.get_pending_clarification()   # returns dict or None
     resolved_user_table: Optional[str] = None
     effective_question = question
- 
+    corrected_entity_name = None
     if pending_clarification:
-        # The user is answering our "which user type?" question
         from app.query.planner import resolve_user_type_table
         resolved_user_table = resolve_user_type_table(question)
- 
+        entity_name = pending_clarification.get("entity_name", "the user")
         if resolved_user_table:
-            # Rebuild the original question enriched with the user type context
             original_q = pending_clarification["original_question"]
-            entity_name = pending_clarification.get("entity_name", "the user")
-            effective_question = (
-                f"{original_q} "
-                f"[Note: {entity_name} is a {question.strip()} — use table {resolved_user_table}]"
-            )
-            logger.info(
-                f"[chronoplot] Clarification resolved: entity='{entity_name}', "
-                f"table='{resolved_user_table}', enriched question='{effective_question}'"
-            )
+            effective_question = f"{original_q} [include table: {resolved_user_table}]"
             mem.clear_pending_clarification()
-            # Override corrector flags — this is now a fully resolved re-run
             corrected_has_user_reference = False
-            corrected_entity_name = None
+            corrected_entity_name = entity_name             # ← preserved
         else:
-            # User's reply didn't match any known user type — ask again
-            mem.clear_pending_clarification()   # clear stale state
+            mem.clear_pending_clarification()
             clarification_text = (
                 "Sorry, I didn't recognise that user type. "
                 "Please choose one of:\n"
@@ -1770,9 +1746,9 @@ async def chronoplot_chat_query(request: Request, body: ChronoChatRequest, _toke
                 page=1,
                 pages_total=1,
             )
-    else:
-        corrected_has_user_reference = corrected.has_user_reference
-        corrected_entity_name = corrected.user_entity_name
+    # else:
+        # corrected_has_user_reference = corrected.has_user_reference
+        # corrected_entity_name = corrected.user_entity_name
  
     # ------------------------------------------------------------------
     # Fallback: session filter keys
@@ -1805,18 +1781,18 @@ async def chronoplot_chat_query(request: Request, body: ChronoChatRequest, _toke
     for attempt in range(max_retries):
         try:
             resolved_entity_name: Optional[str] = None
-            if pending_clarification and resolved_user_table:
-                resolved_entity_name = pending_clarification.get("entity_name")
-            elif corrected_entity_name:
+            if corrected_entity_name:
                 resolved_entity_name = corrected_entity_name
+            elif pending_clarification and resolved_user_table:
+                resolved_entity_name = pending_clarification.get("entity_name")
             plan = await planner.plan(
                 collection_name=ctx.qdrant_collection,
                 question=effective_question,
                 dialect=ctx.dialect,
                 conversation_context=conversation_context,
                 resolved_user_table=resolved_user_table,
-                has_user_reference=corrected_has_user_reference,
-                user_entity_name=resolved_entity_name,
+                has_user_reference=False,
+                user_entity_name=corrected_entity_name,
             )
  
             # ── Clarification needed: user entity detected but type unknown ──
@@ -1844,6 +1820,18 @@ async def chronoplot_chat_query(request: Request, body: ChronoChatRequest, _toke
                 return ChronoChatResponse(mode="empty", text_summary=no_data_text, page=1, pages_total=1)
  
             gen_result = await generator.generate(plan, conversation_context, ctx.qdrant_collection)
+            if gen_result.explanation == "clarification_needed" and gen_result.chat_response:
+                mem.set_pending_clarification({
+                    "original_question": question,
+                    "entity_name": corrected_entity_name or "the user",
+                })
+                save_message(body.thread_id, "assistant", gen_result.chat_response)
+                return ChronoChatResponse(
+                    mode="clarification",
+                    text_summary=gen_result.chat_response,
+                    page=1,
+                    pages_total=1,
+                )
             if gen_result.chat_response and not gen_result.sql:
                 save_message(body.thread_id, "assistant", gen_result.chat_response)
                 return ChronoChatResponse(mode="chat", text_summary=gen_result.chat_response, explanation=gen_result.explanation)
@@ -1892,7 +1880,7 @@ async def chronoplot_chat_query(request: Request, body: ChronoChatRequest, _toke
                     return ChronoChatResponse(mode="empty", text_summary=str(exc), sql_used=val_result.sql)
                 except Exception as exc:
                     logger.error(f"[chronoplot] Filter injection failed: {exc}", exc_info=True)
-                    return ChronoChatResponse(mode="empty", text_summary="Security verification failed.")
+                    return ChronoChatResponse(mode="empty", text_summary="Security verification failed.", sql_used=val_result.sql)
             last_successful_sql = safe_sql
  
             result = await executor.execute(eng, safe_sql)
@@ -1977,7 +1965,7 @@ async def chronoplot_chat_query(request: Request, body: ChronoChatRequest, _toke
             pages_total=1,
         )
     no_data_text = await formatter._humanize_no_data(question)
-    return ChronoChatResponse(mode="empty", text_summary=no_data_text)
+    return ChronoChatResponse(mode="empty", text_summary=no_data_text, sql_used=last_successful_sql)
  
 
 @app.get("/api/chronoplot/chat/threads")

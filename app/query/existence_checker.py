@@ -48,7 +48,7 @@ Output ONLY valid JSON, without any markdown formatting wrappers.
 Example Output:
 {{
   "entity_name": "User 'Viral'",
-  "existence_sql": "SELECT TOP 1 1 FROM dbo.BNR_UserDetails WHERE FirstName LIKE '%Viral%' OR LastName LIKE '%Viral%'",
+  "existence_sql": "SELECT TOP 1 1 FROM dbo.BNR_User_Details WHERE FirstName LIKE '%Viral%' OR LastName LIKE '%Viral%'",
   "reason": "Checking if the fundamental user record exists in the UserDetails table."
 }}
 """
