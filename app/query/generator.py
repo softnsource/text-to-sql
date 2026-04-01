@@ -146,11 +146,6 @@ class SQLGenerator:
 
                 ━━━ CASE A: FULL NAME GIVEN — first="{first_name}" last="{last_name}" ━━━
 
-                Column rules (strict — no exceptions):
-                • FirstName column   → LIKE '%{first_name}%'          ← first part ONLY, never last
-                • LastName column    → LIKE '%{last_name}%'           ← last part ONLY, never first
-                • PreferredName col  → check first part, last part, AND full name — all with OR
-
                 TEMPLATE (use only columns present in schema):
                 WHERE (
                     (t1.FirstName LIKE '%{first_name}%' AND t1.LastName LIKE '%{last_name}%')
@@ -159,23 +154,16 @@ class SQLGenerator:
                     OR t1.PreferredName LIKE '%{full_name}%'
                 )
 
-                EXAMPLE — "Vikas Kohli", schema has PreferredName + FirstName + Surname:
-                WHERE (
-                    (t1.FirstName LIKE '%Vikas%' AND t1.Surname LIKE '%Kohli%')
-                    OR t1.PreferredName LIKE '%Vikas%'
-                    OR t1.PreferredName LIKE '%Kohli%'
-                    OR t1.PreferredName LIKE '%Vikas Kohli%'
-                )
+                ⛔ STRICTLY FORBIDDEN — these extra OR clauses must NEVER appear when full name is given:
+                    OR t1.FirstName LIKE '%{first_name}%'   ← standalone FirstName OR — NEVER
+                    OR t1.LastName  LIKE '%{last_name}%'    ← standalone LastName OR — NEVER
+                    OR t1.FirstName LIKE '%{last_name}%'    ← last name in FirstName — NEVER
+                    OR t1.LastName  LIKE '%{first_name}%'   ← first name in LastName — NEVER
 
-                EXAMPLE — "Vikas Kohli", schema has ONLY FirstName + Surname (no PreferredName, no FullName):
-                WHERE (
-                    t1.FirstName LIKE '%Vikas%' AND t1.Surname LIKE '%Kohli%'
-                )
-
-                ⛔ FORBIDDEN patterns when full name given:
-                    t1.FirstName  LIKE '%Kohli%'                              ← last name in FirstName — NEVER
-                    t1.Surname    LIKE '%Vikas%'                              ← first name in Surname — NEVER
-                    t1.FirstName  LIKE '%Vikas%' OR t1.Surname LIKE '%Vikas%' ← mixing parts across columns — NEVER
+                The ONLY allowed pattern for FirstName and LastName when a full name is given is:
+                    (t1.FirstName LIKE '%{first_name}%' AND t1.LastName LIKE '%{last_name}%')
+                They must ALWAYS appear together inside parentheses joined by AND.
+                They must NEVER appear as standalone OR conditions.
 
                 ━━━ CASE B: SINGLE NAME ONLY — one word="{first_name}" ━━━
 

@@ -1690,7 +1690,7 @@ async def chronoplot_chat_query(request: Request, body: ChronoChatRequest, _toke
     mem = get_session_memory(memory_key)
     conversation_context = mem.get_context_for_prompt()
  
-    max_retries = 3
+    max_retries = 3 
     last_error = ""
     zero_rows_on_last_attempt = False
     JSON_REMINDER = (
