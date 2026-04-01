@@ -84,14 +84,16 @@ class ConversationMemory:
         self._turns.clear()
 
     def set_pending_clarification(self, data: dict) -> None:
-        """
-        Store context needed to resolve a user-type clarification.
-    
-        data = {
-            "original_question": str,   # the question that triggered clarification
-            "entity_name": str,         # the person name detected, e.g. "Louis"
-        }
-        """
+        existing = getattr(self, "_pending_clarification", None)
+        
+        # Never overwrite a real clarification with an empty/unknown one
+        if existing and existing.get("entity_name") and not data.get("entity_name"):
+            logger.warning(
+                f"[memory] Refusing to overwrite valid clarification "
+                f"'{existing}' with empty one '{data}'"
+            )
+            return
+        
         self._pending_clarification = data
         logger.debug(f"[memory] Pending clarification set: {data}")
     
@@ -105,6 +107,17 @@ class ConversationMemory:
         """Remove the pending clarification after it has been resolved."""
         self._pending_clarification = None
         logger.debug("[memory] Pending clarification cleared.")
+
+    def pop_pending_clarification(self) -> Optional[dict]:
+        """
+        Atomically read AND clear pending clarification in one operation.
+        This prevents race conditions where two requests both read it
+        before either clears it.
+        """
+        data = getattr(self, "_pending_clarification", None)
+        self._pending_clarification = None  # clear immediately in same operation
+        logger.debug(f"[memory] Pending clarification popped: {data}")
+        return data
 
 # Session-based memory store (in-memory, not persisted across server restarts)
 # Each entry: {"memory": ConversationMemory, "last_accessed": float}

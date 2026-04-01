@@ -39,6 +39,7 @@ from app.query.spelling_corrector import QuestionCorrector
 from jose import JWTError, jwt as jose_jwt
 from sqlalchemy import create_engine, text as sa_text
 from sqlalchemy.engine import Engine
+from app.query.planner import resolve_user_type_table
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -1715,37 +1716,50 @@ async def chronoplot_chat_query(request: Request, body: ChronoChatRequest, _toke
     # which user type they mean. On the very next turn we check for it.
     # Structure stored: {"original_question": str, "entity_name": str}
     # ------------------------------------------------------------------
-    pending_clarification = mem.get_pending_clarification()   # returns dict or None
+    # pending_clarification = mem.get_pending_clarification()   # returns dict or None
+    pending_clarification = mem.pop_pending_clarification()
     resolved_user_table: Optional[str] = None
     effective_question = question
-    corrected_entity_name = None
+    corrected_entity_name: Optional[str] = getattr(corrected, "user_entity_name", None)
     if pending_clarification:
-        from app.query.planner import resolve_user_type_table
         resolved_user_table = resolve_user_type_table(question)
-        entity_name = pending_clarification.get("entity_name", "the user")
+        entity_name = pending_clarification.get("entity_name", "")
+
         if resolved_user_table:
+            # Consumed successfully ✅
             original_q = pending_clarification["original_question"]
             effective_question = f"{original_q} [include table: {resolved_user_table}]"
-            mem.clear_pending_clarification()
-            corrected_has_user_reference = False
-            corrected_entity_name = entity_name             # ← preserved
+            corrected_entity_name = entity_name
+
         else:
-            mem.clear_pending_clarification()
-            clarification_text = (
-                "Sorry, I didn't recognise that user type. "
-                "Please choose one of:\n"
-                + "\n".join(
-                    f"  {i+1}. {opt['label']}"
-                    for i, opt in enumerate(USER_TYPE_OPTIONS)
+            is_short_reply = len(question.strip().split()) <= 4
+
+            if is_short_reply:
+                # Unrecognised short answer — ask again
+                # Re-store it so user gets another chance
+                mem.set_pending_clarification(pending_clarification)
+                clarification_text = (
+                    "Sorry, I didn't recognise that user type. "
+                    "Please choose one of:\n"
+                    + "\n".join(
+                        f"  {i+1}. {opt['label']}"
+                        for i, opt in enumerate(USER_TYPE_OPTIONS)
+                    )
                 )
-            )
-            save_message(body.thread_id, "assistant", clarification_text)
-            return ChronoChatResponse(
-                mode="clarification",
-                text_summary=clarification_text,
-                page=1,
-                pages_total=1,
-            )
+                save_message(body.thread_id, "assistant", clarification_text)
+                return ChronoChatResponse(
+                    mode="clarification",
+                    text_summary=clarification_text,
+                    page=1,
+                    pages_total=1,
+                )
+            else:
+                # Long new question — restore clarification and treat as fresh
+                mem.set_pending_clarification(pending_clarification)
+                pending_clarification = None
+                resolved_user_table = None
+                effective_question = question
+
     # else:
         # corrected_has_user_reference = corrected.has_user_reference
         # corrected_entity_name = corrected.user_entity_name
@@ -1774,7 +1788,7 @@ async def chronoplot_chat_query(request: Request, body: ChronoChatRequest, _toke
  
     is_super_admin = (user_type == int(UserType.SuperAdmin))
     effective_is_owner = getattr(ctx, "is_owner", False) or is_super_admin
- 
+    clarification_stored = False
     # ------------------------------------------------------------------
     # Step 3 — Main pipeline (with retry loop)
     # ------------------------------------------------------------------
@@ -1798,13 +1812,13 @@ async def chronoplot_chat_query(request: Request, body: ChronoChatRequest, _toke
             # ── Clarification needed: user entity detected but type unknown ──
             if plan.pending_user_type_clarification:
                 clarification_text = plan.clarification_questions[0]
- 
-                # Store context in memory so we can pick it up on the next turn
-                mem.set_pending_clarification({
-                    "original_question": question,
-                    "entity_name": plan.pending_entity_name or corrected_entity_name or "the user",
-                })
- 
+                entity_for_clarification = plan.pending_entity_name or corrected_entity_name
+                if entity_for_clarification and not clarification_stored:
+                    mem.set_pending_clarification({
+                        "original_question": question,
+                        "entity_name": entity_for_clarification,
+                    })
+                    clarification_stored = True
                 save_message(body.thread_id, "assistant", clarification_text)
                 return ChronoChatResponse(
                     mode="clarification",
@@ -1812,6 +1826,7 @@ async def chronoplot_chat_query(request: Request, body: ChronoChatRequest, _toke
                     page=1,
                     pages_total=1,
                 )
+
  
             # ── No tables found and still needs clarification ──
             if plan.needs_clarification and not plan.relevant_tables:
@@ -1821,10 +1836,11 @@ async def chronoplot_chat_query(request: Request, body: ChronoChatRequest, _toke
  
             gen_result = await generator.generate(plan, conversation_context, ctx.qdrant_collection)
             if gen_result.explanation == "clarification_needed" and gen_result.chat_response:
-                mem.set_pending_clarification({
-                    "original_question": question,
-                    "entity_name": corrected_entity_name or "the user",
-                })
+                if corrected_entity_name:
+                    mem.set_pending_clarification({
+                        "original_question": question,
+                        "entity_name": corrected_entity_name,
+                    })
                 save_message(body.thread_id, "assistant", gen_result.chat_response)
                 return ChronoChatResponse(
                     mode="clarification",
