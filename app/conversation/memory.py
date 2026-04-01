@@ -1,7 +1,9 @@
 """Conversation memory - stores and retrieves conversation history, manages context window for Gemini."""
 
+import json
 import logging
 import time
+import pathlib
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
@@ -33,6 +35,7 @@ class ConversationMemory:
         """
         self._max_turns = max_turns
         self._turns: List[ConversationTurn] = []
+        self._pending_clarification: Optional[dict] = None
 
     def add_turn(self, turn: ConversationTurn) -> None:
         """Add a turn to history. Drops oldest if over limit.
@@ -123,6 +126,57 @@ class ConversationMemory:
 # Each entry: {"memory": ConversationMemory, "last_accessed": float}
 _session_memories: Dict[str, Dict] = {}
 
+MEMORY_DIR = pathlib.Path("uploads/session_store")
+MEMORY_DIR.mkdir(exist_ok=True, parents=True)
+
+def _load_memory_from_disk(session_id: str, memory: ConversationMemory) -> bool:
+    path = MEMORY_DIR / f"{session_id}_memory.json"
+    if not path.exists():
+        return False
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        memory.clear()
+        for turn_data in data.get("turns", []):
+            memory.add_turn(ConversationTurn(
+                question=turn_data.get("question", ""),
+                sql_generated=turn_data.get("sql_generated"),
+                result_summary=turn_data.get("result_summary"),
+                services_used=turn_data.get("services_used", []),
+                filters_applied=turn_data.get("filters_applied", []),
+                result_sample=turn_data.get("result_sample", [])
+            ))
+        memory._pending_clarification = data.get("pending_clarification")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to load memory from disk for {session_id}: {e}")
+        return False
+
+def save_session_memory(session_id: str):
+    """Save the in-memory session to disk for multi-worker sync."""
+    if session_id not in _session_memories:
+        return
+    memory: ConversationMemory = _session_memories[session_id]["memory"]
+    path = MEMORY_DIR / f"{session_id}_memory.json"
+    try:
+        data = {
+            "turns": [
+                {
+                    "question": turn.question,
+                    "sql_generated": turn.sql_generated,
+                    "result_summary": turn.result_summary,
+                    "services_used": turn.services_used,
+                    "filters_applied": turn.filters_applied,
+                    "result_sample": turn.result_sample,
+                }
+                for turn in memory.get_history()
+            ],
+            "pending_clarification": memory.get_pending_clarification()
+        }
+        path.write_text(json.dumps(data), encoding="utf-8")
+    except Exception as e:
+        logger.error(f"Failed to save memory to disk for {session_id}: {e}")
+
+
 
 def _cleanup_expired_sessions() -> None:
     """Remove sessions older than SESSION_TTL_SECONDS."""
@@ -152,11 +206,15 @@ def get_session_memory(session_id: str, max_turns: int = 4) -> ConversationMemor
         _cleanup_expired_sessions()
 
     if session_id not in _session_memories:
+        memory = ConversationMemory(max_turns=max_turns)
+        _load_memory_from_disk(session_id, memory)
         _session_memories[session_id] = {
-            "memory": ConversationMemory(max_turns=max_turns),
+            "memory": memory,
             "last_accessed": time.time()
         }
     else:
+        memory = _session_memories[session_id]["memory"]
+        _load_memory_from_disk(session_id, memory)
         _session_memories[session_id]["last_accessed"] = time.time()
 
     return _session_memories[session_id]["memory"]
@@ -170,6 +228,9 @@ def clear_session_memory(session_id: str) -> None:
     """
     if session_id in _session_memories:
         _session_memories[session_id]["memory"].clear()
+    path = MEMORY_DIR / f"{session_id}_memory.json"
+    if path.exists():
+        path.unlink(missing_ok=True)
 
 
 def delete_session_memory(session_id: str) -> None:
@@ -180,3 +241,6 @@ def delete_session_memory(session_id: str) -> None:
     """
     if session_id in _session_memories:
         del _session_memories[session_id]
+    path = MEMORY_DIR / f"{session_id}_memory.json"
+    if path.exists():
+        path.unlink(missing_ok=True)

@@ -105,6 +105,7 @@ async def build_enriched_schema(
     plan: QueryPlan,
     qdrant_collection: str,
     question: str = "",
+    resolved_user_table: Optional[str] = None
 ) -> Tuple[Optional[str], Optional[str]]:
     """
     Returns (schema_str, clarification_msg).
@@ -114,19 +115,32 @@ async def build_enriched_schema(
     from app.training.indexer import Indexer
     indexer = Indexer()
     logger.info(f"Relevant table : {plan.relevant_tables}")
+    def _safe(val):
+        return None if (val is None or str(val).strip().lower() == 'none') else val
+
+    effective_resolved_table = _safe(resolved_user_table) or _safe(plan.resolved_user_table)
+
+    logger.info(f"[enricher] effective_resolved_table='{effective_resolved_table}' (raw plan='{plan.resolved_user_table}', raw param='{resolved_user_table}')")
+
     needed = set()
     for t in plan.relevant_tables:
         needed.add(t.table_name.lower())
         for fk in t.foreign_keys:
             needed.add(fk['to_table'].lower())
 
+    logger.info(
+        f"[enricher] plan.resolved_user_table='{plan.resolved_user_table}' "
+        f"needed={needed}"
+    )
     # ------------------------------------------------------------------
     # KEY FIX: If the user already resolved which user-type table to use,
     # strip every OTHER user-type table out of `needed` right now.
     # This prevents the clarification check below from firing again,
     # which was causing the infinite loop.
     # ------------------------------------------------------------------
-    if plan.resolved_user_table and plan.resolved_user_table != "__skip__":
+    logger.info(f"[enricher] resolved_user_table check: '{effective_resolved_table}', needed before strip: {needed}")
+
+    if effective_resolved_table and effective_resolved_table != "__skip__":
         resolved_normalized = _normalize_table_name(plan.resolved_user_table)
         tables_to_remove = {
             t for t in needed

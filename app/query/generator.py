@@ -59,9 +59,10 @@ class SQLGenerator:
     ) -> GenerationResult:
         # schema_context = build_enriched_schema(plan, session_id)
         schema, clarification = await build_enriched_schema(
-            plan, 
-            qdrant_collection=session_id,   # session_id is the qdrant collection
+            plan,
+            qdrant_collection=session_id,
             question=plan.question,
+            resolved_user_table=plan.resolved_user_table,  # ← explicit pass
         )
 
         if clarification:
@@ -150,7 +151,6 @@ class SQLGenerator:
                 WHERE (
                     (t1.FirstName LIKE '%{first_name}%' AND t1.LastName LIKE '%{last_name}%')
                     OR t1.PreferredName LIKE '%{first_name}%'
-                    OR t1.PreferredName LIKE '%{last_name}%'
                     OR t1.PreferredName LIKE '%{full_name}%'
                 )
 
@@ -162,8 +162,8 @@ class SQLGenerator:
 
                 The ONLY allowed pattern for FirstName and LastName when a full name is given is:
                     (t1.FirstName LIKE '%{first_name}%' AND t1.LastName LIKE '%{last_name}%')
-                They must ALWAYS appear together inside parentheses joined by AND.
-                They must NEVER appear as standalone OR conditions.
+                They must ALWAYS appear together joined by AND.
+                You MAY use OR conditions for PreferredName (e.g., OR t1.PreferredName LIKE '%{first_name}%').
 
                 ━━━ CASE B: SINGLE NAME ONLY — one word="{first_name}" ━━━
 
@@ -198,10 +198,9 @@ class SQLGenerator:
                 HARD RULES (never violate)
                 ─────────────────────────────────────────
                 1. Always use PreferredName if the column exists in the schema for {plan.resolved_user_table}.
-                2. FULL NAME → FirstName column = first part ONLY. LastName column = last part ONLY.
-                3. FULL NAME → PreferredName checks all parts (first, last, combined) with OR.
+                2. FULL NAME → FirstName column = first part ONLY. LastName column = last part ONLY. NO standalone OR clauses for FirstName or LastName.
+                3. FULL NAME → You MAY use PreferredName with OR to check the first name or full name.
                 4. SINGLE NAME → every name column gets the same single word, all joined with OR.
-                5. PreferredName is ONLY included if it exists in the schema for {plan.resolved_user_table}.
                 6. NEVER use Email, Phone, or any forbidden column for name resolution.
                 7. NEVER use columns not present in the schema for {plan.resolved_user_table}.
                 8. NEVER invent columns (e.g. "Name", "UserName") that don't exist in the schema.
@@ -258,7 +257,11 @@ class SQLGenerator:
             6. FOLLOWUP  → user is referring to something from CONVERSATION HISTORY above.
                         Look at the previous SQL in history and expand/modify it to answer
                         the current question. Keep the same filters/WHERE conditions from
-                        the previous SQL. Remove any TOP 1 limits. Add more columns if needed.
+                        the previous SQL, EXCEPT when the new question specifies a different
+                        person or role (e.g., switching from querying "service user" to "staff member").
+                        If the person or role changes, you MUST drop the old entity filters and
+                        strictly apply only the new ones from the PERSON NAME FILTER block.
+                        Remove any TOP 1 limits. Add more columns if needed.
                         Examples of followup signals: "give me details", "show more", "tell me 
                         more", "its information", "show that", "expand", "what about that",
                         anything using "its", "that", "those", "it", "this", "same", "above"
@@ -304,6 +307,17 @@ class SQLGenerator:
             
             IMPORTANT DATATYPE RULE: You must purely look at the datatypes annotated in the DATABASE SCHEMA (e.g. VARCHAR, NVARCHAR, INT, FLOAT, BOOLEAN, DATE) to decide this. Do NOT guess the type based on the column name alone.
             
+            8. NAME SEARCH RULE (CRITICAL):
+            When filtering on a person's name using FirstName, LastName, Surname, or PreferredName:
+            - If the user provides a FULL NAME (multiple words, like "krunal pandya"):
+              You MUST ONLY use AND between the different name parts. 
+              ✅ RIGHT: (t1.FirstName LIKE '%krunal%' AND t1.LastName LIKE '%pandya%')
+              ⛔ WRONG: (t1.FirstName LIKE '%krunal%' OR t1.LastName LIKE '%pandya%')
+              ⛔ WRONG: (t1.FirstName LIKE '%krunal%' AND t1.LastName LIKE '%pandya%' OR t1.FirstName LIKE '%krunal%')
+              NEVER generate a standalone OR for a first name or last name when a full name is given.
+            - If the user provides a SINGLE NAME (one word, like "vikas"):
+              You may check all name columns with OR, using the SAME single word for every column.
+              ✅ RIGHT: (t1.FirstName LIKE '%vikas%' OR t1.LastName LIKE '%vikas%')            
             8. UNION COLUMN PARITY RULE (CRITICAL):
             When writing a UNION query, ALL SELECT branches MUST have the IDENTICAL
             number of columns in the SAME order.
@@ -357,7 +371,8 @@ class SQLGenerator:
             RULES:
             
             1. ONLY select columns that are directly relevant to the user's question.
-            - MAXIMUM 3-6 COLUMNS: Do NOT output massive, wide tables. If a table has many descriptive columns (like 10+ intervention or behavioral notes), pick ONLY the 3 to 5 most important core fields (e.g. Title, Name, Status, Date) and ignore the rest to avoid overwhelming the user.
+            - EXTREMELY IMPORTANT: If the question asks for data from a specific joined table (e.g., "Sleep Chart Details"), prioritize selecting columns from THAT joined table (e.g., T2) rather than selecting all fields solely from the primary person table (T1).
+            - MAXIMUM 3-6 COLUMNS: Pick ONLY the 3 to 5 most important core fields (e.g. Title, Name, Status, Date) across the relevant tables. Ignore the rest to avoid overwhelming the user.
             - Do NOT use SELECT * unless the user literally writes "select *" or "all details".
             
             2. NEVER include TECHNICAL, SYSTEM, or DATE columns in the SELECT output unless explicitly asked:

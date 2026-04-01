@@ -258,6 +258,7 @@ class QueryPlanner:
         # # 1. User-entity clarification gate
         # # ------------------------------------------------------------------
         # No name-based clarification gate — proceed directly
+        logger.info(f"Resolve user table from plan : {resolved_user_table}")
         user_opted_out = resolved_user_table == "__skip__"
         effective_resolved_table = None if user_opted_out else resolved_user_table
         logger.info(f"effective_resolved_table: {effective_resolved_table}")
