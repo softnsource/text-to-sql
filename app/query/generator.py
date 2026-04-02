@@ -45,6 +45,16 @@ def expand_boolean_conditions(sql: str) -> str:
     pattern = r"(\w+\.\w+)\s*=\s*(1|0|true|false)"
     return re.sub(pattern, replacer, sql, flags=re.IGNORECASE)
 
+
+def ensure_distinct(sql: str) -> str:
+    """Ensure every SELECT statement uses DISTINCT (safety net post-processor)."""
+    # Match SELECT keywords that are NOT already followed by DISTINCT
+    # Handles: SELECT, SELECT TOP N, SELECT ALL
+    # Skips: SELECT DISTINCT (already has it), SELECT COUNT/SUM/AVG/MIN/MAX(
+    pattern = r'\bSELECT\b(?!\s+DISTINCT\b)(?!\s+(?:COUNT|SUM|AVG|MIN|MAX)\s*\()'
+    return re.sub(pattern, 'SELECT DISTINCT', sql, flags=re.IGNORECASE)
+
+
 class SQLGenerator:
     """Generates dialect-aware SQL from a query plan using Gemini."""
 
@@ -244,6 +254,28 @@ class SQLGenerator:
             {enum_block}
 
             =====================
+            ENUM MATCHING RULE (CRITICAL — READ CAREFULLY)
+            =====================
+            When matching the user's words to an ENUM synonym in the ENUM VALUE MAP above:
+            1. NORMALIZE the user's input: convert to lowercase AND remove ALL underscores and hyphens.
+               Example: "Maternity Leave" → "maternity leave"
+               Example: "maternity_leave" → "maternity leave"
+               Example: "Long_Term_Leave" → "long term leave"
+            2. NORMALIZE each synonym key the same way before comparing.
+            3. Find the synonym whose normalized form BEST MATCHES the user's normalized input.
+            4. Use the INTEGER value mapped to that synonym — not the integer of a different synonym.
+            
+            EXAMPLE:
+            User says: "users who are currently on maternity leave"
+            → Normalized user input contains: "maternity leave"
+            → Synonym match: "maternity leave" → 2
+            → Correct SQL: WHERE Status = 2
+            ⛔ WRONG: WHERE Status = 1  (1 = active, NOT maternity leave)
+            
+            ALWAYS double-check the integer value you pick against the ENUM VALUE MAP.
+            If "maternity leave" maps to 2, then Status = 2. NEVER confuse it with Status = 1 (active).
+
+            =====================
             INTENT DETECTION (CHECK THIS FIRST)
             =====================
             
@@ -289,6 +321,16 @@ class SQLGenerator:
             5. JOIN tables ONLY using FK relationships listed in SCHEMA.
             
             6. Use aliases: t1, t2, t3, t4
+
+            7. ALWAYS USE SELECT DISTINCT (CRITICAL — NEVER OMIT):
+            Every SELECT statement you generate MUST use SELECT DISTINCT.
+            This applies universally — whether or not the query has JOINs.
+            ✅ RIGHT: SELECT DISTINCT t1.FirstName, t1.LastName
+            ✅ RIGHT: SELECT DISTINCT TOP 10 t1.Title, t1.Status
+            ⛔ WRONG: SELECT t1.FirstName, t1.LastName
+            ⛔ WRONG: SELECT TOP 10 t1.Title, t1.Status
+            For SQL Server with TOP N: SELECT DISTINCT TOP N ...
+            For aggregates (COUNT, SUM, AVG etc.): Still use SELECT DISTINCT if selecting raw columns alongside aggregates, but pure aggregate queries (e.g. SELECT COUNT(*)) do not need DISTINCT.
             
             7. STRING FILTER RULE (CRITICAL):
             When filtering on a text/varchar column, ALWAYS use LIKE instead of =.
@@ -643,6 +685,7 @@ class SQLGenerator:
                 return GenerationResult(sql="", explanation=explanation, chat_response=chat_response)
 
             sql = expand_boolean_conditions(sql)
+            sql = ensure_distinct(sql)
             logger.info(f"Sql -> {sql}")
             if not sql:
                 raise ValueError("Gemini returned empty SQL")

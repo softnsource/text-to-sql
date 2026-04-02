@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, Dict, List
  
 # ---------------------------------------------------------------------------
 # Master registry
@@ -67,10 +67,6 @@ ENUM_REGISTRY: dict[str, dict[str, dict[str, Any]]] = {
         "Status": {
             "db_type": "int",
             "synonyms": {
-                "deactive": 0,
-                "deactivated": 0,
-                "inactive": 0,
-                "disabled": 0,
                 "active": 1,
                 "enabled": 1,
                 "maternityleave": 2,
@@ -83,7 +79,11 @@ ENUM_REGISTRY: dict[str, dict[str, dict[str, Any]]] = {
                 "suspended": 4,
                 "inactive_status": 5,
                 "inactive_user": 5,
-                "inactive account": 5
+                "inactive account": 5,
+                "deactive": 5,
+                "deactivated": 5,
+                "inactive": 5,
+                "disabled": 5,
             },
         },
     },
@@ -1639,12 +1639,20 @@ def build_enum_prompt_block(relevant_enums: dict) -> str:
         for col, meta in columns.items():
             lines.append(f"  Column: {col}  [{meta['db_type']}]")
             # Group synonyms by their integer value for clean display
-            value_to_synonyms: dict[int, list[str]] = {}
+            # Normalize keys: lowercase + replace underscores with spaces
+            value_to_synonyms: Dict[int, List[str]] = {}
             for synonym, value in meta["synonyms"].items():
-                value_to_synonyms.setdefault(value, []).append(synonym)
+                normalized = synonym.lower().replace("_", " ")
+                value_to_synonyms.setdefault(value, []).append(normalized)
+            # Deduplicate after normalization
             for value in sorted(value_to_synonyms.keys()):
-                synonyms = value_to_synonyms[value]
-                syn_str = ", ".join(f'"{s}"' for s in synonyms)
+                seen = set()
+                unique_synonyms = []
+                for s in value_to_synonyms[value]:
+                    if s not in seen:
+                        seen.add(s)
+                        unique_synonyms.append(s)
+                syn_str = ", ".join(f'"{s}"' for s in unique_synonyms)
                 lines.append(f"    {syn_str}  →  {value}")
         lines.append("")
  
