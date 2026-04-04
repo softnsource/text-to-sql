@@ -2,6 +2,7 @@
 __pycache__
 *.pyc
 .env
+credentials.json
 venv/
 .venv
 uploads/session_store/

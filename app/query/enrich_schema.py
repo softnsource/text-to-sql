@@ -114,7 +114,6 @@ async def build_enriched_schema(
     """
     from app.training.indexer import Indexer
     indexer = Indexer()
-    logger.info(f"Relevant table : {plan.relevant_tables}")
     def _safe(val):
         return None if (val is None or str(val).strip().lower() == 'none') else val
 

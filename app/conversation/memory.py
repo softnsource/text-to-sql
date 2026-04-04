@@ -36,6 +36,7 @@ class ConversationMemory:
         self._max_turns = max_turns
         self._turns: List[ConversationTurn] = []
         self._pending_clarification: Optional[dict] = None
+        self.pii_vault_map: Dict[str, str] = {}
 
     def add_turn(self, turn: ConversationTurn) -> None:
         """Add a turn to history. Drops oldest if over limit.
@@ -146,6 +147,7 @@ def _load_memory_from_disk(session_id: str, memory: ConversationMemory) -> bool:
                 result_sample=turn_data.get("result_sample", [])
             ))
         memory._pending_clarification = data.get("pending_clarification")
+        memory.pii_vault_map = data.get("pii_vault_map", {})
         return True
     except Exception as e:
         logger.error(f"Failed to load memory from disk for {session_id}: {e}")
@@ -170,7 +172,8 @@ def save_session_memory(session_id: str):
                 }
                 for turn in memory.get_history()
             ],
-            "pending_clarification": memory.get_pending_clarification()
+            "pending_clarification": memory.get_pending_clarification(),
+            "pii_vault_map": getattr(memory, "pii_vault_map", {})
         }
         path.write_text(json.dumps(data), encoding="utf-8")
     except Exception as e:

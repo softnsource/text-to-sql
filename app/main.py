@@ -40,6 +40,9 @@ from jose import JWTError, jwt as jose_jwt
 from sqlalchemy import create_engine, text as sa_text
 from sqlalchemy.engine import Engine
 from app.query.planner import resolve_user_type_table
+from app.utils.pii_vault import pii_vault
+from app.history.user_history import save_user_history
+from app.history.gdrive_sync import start_gdrive_sync_job, stop_gdrive_sync_job
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -53,6 +56,9 @@ limiter = Limiter(key_func=get_remote_address)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Start background session cleanup task."""
+    start_gdrive_sync_job()
+    yield
+    stop_gdrive_sync_job()
     async def cleanup_loop():
         store = get_session_store()
         interval = settings.session.cleanup_interval_minutes * 60
@@ -100,7 +106,6 @@ app.mount(
 
 connector = UniversalConnector()
 planner = QueryPlanner()
-from app.query.generator import SQLGenerator
 generator = SQLGenerator()
 validator = SQLValidator()
 executor = QueryExecutor()
@@ -199,6 +204,69 @@ class RegisterRequest(BaseModel):
     username: str
     password: str
 
+def _extract_db_name(conn_str: str) -> str:
+    """Extract database name from connection string for display."""
+    try:
+        parts = conn_str.split("/")
+        name = parts[-1].split("?")[0]
+        return name or "database"
+    except Exception:
+        return "database"
+
+async def _get_table_schemas(ctx: SessionContext) -> Dict[str, Any]:
+    """
+    Fetch full table schema payloads for the session.
+
+    Returns Dict[str, dict] — full payload per table (includes reverse_foreign_keys).
+    The filter verifier supports both full payloads and plain column lists,
+    so this change is backward-compatible.
+    """
+    if ctx.tables:
+        # ctx.tables are TableInfo objects — build a payload-shaped dict manually.
+        # reverse_foreign_keys are NOT on TableInfo, so we compute them here
+        # the same way the indexer does.
+        reverse_fk_map: Dict[str, list] = {}
+        for t in ctx.tables:
+            for fk in t.foreign_keys:
+                target = fk["to_table"].lower()
+                reverse_fk_map.setdefault(target, []).append({
+                    "referencing_table": t.table_name,
+                    "referencing_col":   fk["from"],
+                    "local_col":         fk["to_col"],
+                })
+
+        schemas = {}
+        for t in ctx.tables:
+            schemas[t.table_name.lower()] = {
+                "table_name":           t.table_name,
+                "columns":              [{"name": c.name, "type": c.data_type} for c in t.columns],
+                "foreign_keys":         t.foreign_keys,
+                "reverse_foreign_keys": reverse_fk_map.get(t.table_name.lower(), []),
+                "row_count":            t.row_count,
+            }
+        return schemas
+
+    # Fallback: load from Qdrant (session restored from saved model, no ctx.tables)
+    from app.training.indexer import Indexer
+    indexer = Indexer()
+    try:
+        results = await indexer.search(
+            ctx.qdrant_collection,
+            "list all tables",
+            top_k=200,
+        )
+        schemas = {}
+        for r in results:
+            t_name = r.get("table_name", "").lower()
+            if t_name:
+                # r is already the full Qdrant payload — store it as-is.
+                # reverse_foreign_keys is present because the indexer stores it.
+                schemas[t_name] = r
+        return schemas
+    except Exception as e:
+        logger.error(f"Failed to fetch schemas from Qdrant: {e}")
+        return {}
+    
 @app.get("/")
 async def root():
     """Serve React frontend."""
@@ -331,6 +399,7 @@ async def load_model(model_id: int, user: User = Depends(get_current_user)):
         )
         await get_session_store().register(ctx)
         save_session(ctx)
+        logger.info(f"Model {model_id} loaded successfully into session {session_id}")
         return {
             "session_id": session_id, 
             "is_owner": ctx.is_owner,
@@ -377,927 +446,6 @@ async def update_model_metadata(model_id: int, body: UpdateModelMetadataRequest,
 @app.get("/health")
 async def health():
     return {"status": "ok", "sessions": get_session_store().count()}
-
-
-@app.post("/api/db/connect", response_model=ConnectResponse)
-async def connect_db(
-    request: Request,
-    type: str = Form(..., description="upload or connection_string"),
-    connection_string: Optional[str] = Form(None),
-    db_file: Optional[UploadFile] = File(None),
-):
-    """Connect a database. Accepts file upload (SQLite) or connection string."""
-    session_id = str(uuid.uuid4())
-
-    try:
-        if type == "upload":
-            if not db_file:
-                raise HTTPException(status_code=400, detail="No file uploaded.")
-            file_bytes = await db_file.read()
-            engine = connector.from_upload(session_id, file_bytes, db_file.filename or "db.sqlite")
-            dialect = "sqlite"
-            db_name = db_file.filename or "uploaded_database"
-            db_key = hashlib.sha256(file_bytes).hexdigest()
-        elif type == "connection_string":
-            if not connection_string:
-                raise HTTPException(status_code=400, detail="connection_string is required.")
-            engine = connector.from_connection_string(connection_string)
-            dialect = connector._detect_dialect(connection_string)
-            db_name = _extract_db_name(connection_string)
-            db_key = hashlib.sha256(connection_string.encode()).hexdigest()
-        else:
-            raise HTTPException(status_code=400, detail="type must be 'upload' or 'connection_string'.")
-
-    except (ConnectionError, UnsupportedDialectError) as e:
-        raise HTTPException(status_code=422, detail=str(e))
-
-    ctx = SessionContext(
-        session_id=session_id,
-        engine=engine,
-        dialect=dialect,
-        db_name=db_name,
-        source_type=type,
-        table_count=0,
-        qdrant_collection=f"{settings.qdrant.collection_prefix}_{db_key}",
-        db_key=db_key,
-        connection_string=connection_string,
-        is_owner=True
-    )
-    await get_session_store().register(ctx)
-    save_session(ctx)
-    return ConnectResponse(
-        session_id=session_id,
-        dialect=dialect,
-        db_name=db_name,
-        message="Connected. Call /api/db/train/{session_id} to start indexing.",
-    )
-
-
-@app.get("/api/db/train/{session_id}")
-async def train_db(session_id: str):
-    """Stream training progress via Server-Sent Events."""
-    ctx = await get_session_store().get(session_id)
-    if not ctx:
-        persisted = load_session(session_id)
-        if not persisted:
-            raise HTTPException(status_code=404, detail="Session not found or expired.")
-        
-        # Rebuild a minimal SessionContext (engine cannot be recovered for upload)
-        ctx = SessionContext(
-
-            session_id=persisted["session_id"],
-            engine=None,  # Engine is gone, cannot run queries, but schema/Qdrant works
-            dialect=persisted["dialect"],
-            db_name=persisted["db_name"],
-            source_type="unknown",
-            table_count=0,
-            qdrant_collection=persisted["qdrant_collection"],
-            db_key=persisted["db_key"],
-            training_complete=persisted.get("training_complete", True),
-            connection_string=persisted.get("connection_string"),
-            common_filter_keys=persisted.get("common_filter_keys", []),
-            session_filter_values=persisted.get("session_filter_values", {}),
-            is_owner=persisted.get("is_owner", False)
-
-        )
-
-    pipeline = TrainingPipeline()
-
-    logger.info("Out from Training Pipeline")
-    async def event_stream():
-        # Send immediate keepalive so client knows connection is open
-        # (schema extraction on large DBs can take > 2 min before first yield)
-        yield ": keepalive\n\n"
-        try:
-            cached_data = pipeline._load_schema_cache(ctx.db_key) if ctx.db_key else None
-            if cached_data is not None:
-                logger.info("If call")
-                tables, descriptions = cached_data
-                logger.info(tables)
-
-            else:
-                tables = await pipeline.extract_only(session_id, ctx.engine)
-
-            ctx.tables = tables
-            await get_session_store().register(ctx)
-
-            data = {
-                "step": "tables_ready",
-                "progress": 100,
-                "tables_done": len(tables),
-                "tables_total": len(tables),
-                "message": "Tables extracted. Please provide descriptions.",
-                "error": ""
-            }
-
-            yield f"data: {json.dumps(data)}\n\n"
-
-        except Exception as e:
-            error_data = {
-                "step": "error",
-                "message": str(e)
-            }
-            yield f"data: {json.dumps(error_data)}\n\n"
-
-    return StreamingResponse(
-        event_stream(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
-
-
-@app.get("/api/session/{session_id}/schema", response_model=List[SchemaTable])
-async def get_schema(session_id: str):
-    """Return list of indexed tables for the session sidebar."""
-    from app.training.indexer import Indexer
-    ctx = await get_session_store().get(session_id)
-    if not ctx:
-        persisted = load_session(session_id)
-        if not persisted:
-            raise HTTPException(status_code=404, detail="Session not found or expired.")
-        
-        # Rebuild a minimal SessionContext (engine cannot be recovered for upload)
-        ctx = SessionContext(
-            session_id=persisted["session_id"],
-            engine=None,  # Engine is gone, cannot run queries, but schema/Qdrant works
-            dialect=persisted["dialect"],
-            db_name=persisted["db_name"],
-            source_type="unknown",
-            table_count=0,
-            qdrant_collection=persisted["qdrant_collection"],
-            db_key=persisted["db_key"],
-            training_complete=persisted.get("training_complete", True),
-            connection_string=persisted.get("connection_string"),
-            common_filter_keys=persisted.get("common_filter_keys", []),
-            session_filter_values=persisted.get("session_filter_values", {}),
-            is_owner=persisted.get("is_owner", False)
-
-        )
-    logger.info(f"CTX : {ctx}")
-    indexer = Indexer()
-    try:
-        # Search with a broad query to get all table payloads
-        results = await indexer.search(ctx.qdrant_collection, "list all tables", top_k=200)
-        return [
-            SchemaTable(
-                table_name=r.get("table_name", ""),
-                schema_name=r.get("schema_name"),
-                description=r.get("description", ""),
-                row_count=r.get("row_count", 0),
-                column_count=len(r.get("columns", [])),
-            )
-            for r in results
-        ]
-    except Exception as e:
-        logger.error(f"Schema fetch error: {e}", exc_info=True)
-        raise DBError("Unable to retrieve database schema. Please check your connection and try again.")
-
-
-@app.get("/api/db/tables/{session_id}")
-async def get_tables(session_id: str):
-    ctx = await get_session_store().get(session_id)
-
-    if not ctx:
-        raise HTTPException(404, "Session not found")
-
-    pipeline = TrainingPipeline()
-
-    tables = await pipeline.extract_only(session_id, ctx.engine)
-
-    # Save tables temporarily (important)
-    ctx.tables = tables  
-
-    return [
-        {
-            "table_name": t.table_name,
-            "schema_name": t.schema_name,
-            "row_count": t.row_count,
-            "columns": [c.name for c in t.columns]
-        }
-        for t in tables
-    ]
-
-
-@app.post("/api/db/train-with-input")
-async def train_with_user_input(body: TrainWithUserInputRequest):
-    ctx = await get_session_store().get(body.session_id)
-    logger.info(ctx)
-    if not ctx:
-        raise HTTPException(404, "Session not found")
-
-    if not hasattr(ctx, "tables"):
-        raise HTTPException(400, "Tables not loaded. Call /tables first.")
-
-    user_desc_map = {
-        t.table_name: t.user_description
-        for t in body.tables
-        if t.user_description
-    }
-
-    pipeline = TrainingPipeline()
-
-    async def event_stream():
-        async for progress in pipeline.run_with_user_input(
-            session_id=body.session_id,
-            tables=ctx.tables,
-            user_descs=user_desc_map,
-            dialect=ctx.dialect,
-            qdrant_collection=ctx.qdrant_collection,
-            db_key=ctx.db_key
-        ):
-            yield f"data: {json.dumps(progress.__dict__)}\n\n"
-
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
-
-
-@app.post("/api/session/{session_id}/filter-keys")
-async def save_filter_keys(session_id: str, body: FilterKeysRequest):
-    ctx = await get_session_store().get(session_id)
-    if not ctx:
-        raise HTTPException(404, "Session not found")
-    ctx.common_filter_keys = body.keys
-    save_session(ctx)
-    return {"message": "Filter keys saved successfully"}
-
-
-@app.post("/api/session/{session_id}/filter-values")
-async def save_filter_values(session_id: str, body: FilterValuesRequest):
-    logger.info(f"POST /api/session/{session_id}/filter-values: {body.values}")
-    ctx = await get_session_store().get(session_id)
-    if not ctx:
-        logger.warning(f"Session {session_id} not in memory, attempting to load from disk")
-        persisted = load_session(session_id)
-        if not persisted:
-            raise HTTPException(404, "Session not found")
-        ctx = SessionContext(**persisted)
-        ctx.session_filter_values = body.values
-        await get_session_store().register(ctx)
-        save_session(ctx)
-    else:
-        ctx.session_filter_values = body.values
-        save_session(ctx)
-    logger.info(f"Saved session_filter_values for {session_id}: {ctx.session_filter_values}")
-    return {"message": "Filter values saved for this session"}
-
-
-@app.get("/api/session/{session_id}/schema-report")
-async def get_schema_report(session_id: str):
-    """Return the full schema + AI description report as JSON.
-
-    Written to uploads/{session_id}/schema_report.json after training,
-    but falls back to Qdrant for loaded sessions.
-    """
-    import pathlib, json as _json
-    report_path = pathlib.Path(settings.uploads.dir) / session_id / "schema_report.json"
-    if report_path.exists():
-        try:
-            data = _json.loads(report_path.read_text(encoding="utf-8"))
-            return data
-        except Exception as e:
-            logger.warning(f"Error reading schema_report.json: {e}")
-            pass
-            
-    # Fallback to Qdrant if file doesn't exist (e.g., loaded model)
-    ctx = await get_session_store().get(session_id)
-    if not ctx:
-        ctx_data = load_session(session_id)
-        if ctx_data:
-            ctx = SessionContext(**ctx_data)
-            
-    if ctx and ctx.qdrant_collection:
-        from app.training.indexer import Indexer
-        indexer = Indexer()
-        try:
-            scroll_results = indexer.client.scroll(
-                collection_name=ctx.qdrant_collection,
-                limit=500,
-                with_payload=True
-            )
-            return [r.payload for r in scroll_results[0]]
-        except Exception as e:
-            logger.error(f"Failed to fetch schema report from Qdrant: {e}")
-            
-    raise HTTPException(
-        status_code=404,
-        detail="Schema report not found. Training may not have completed yet.",
-    )
-
-
-# @app.post("/api/chat/query", response_model=ChatResponse)
-# @limiter.limit("20/minute")
-# async def chat_query(request: Request, body: ChatRequest):
-#     """Run the full NL → SQL → format pipeline."""
-#     ctx = await get_session_store().get(body.session_id)
-#     last_error = ""
-#     zero_rows_on_last_attempt = False
-#     if not ctx:
-#         persisted = load_session(body.session_id)
-#         if not persisted:
-#             raise HTTPException(status_code=404, detail="Session not found or expired.")
-        
-#         # Rebuild a minimal SessionContext (engine cannot be recovered for upload)
-#         ctx = SessionContext(
-#             session_id=persisted["session_id"],
-#             engine=None,  # Engine is gone, cannot run queries, but schema/Qdrant works
-#             dialect=persisted["dialect"],
-#             db_name=persisted["db_name"],
-#             source_type="unknown",
-#             table_count=0,
-#             qdrant_collection=persisted["qdrant_collection"],
-#             db_key=persisted["db_key"],
-#             training_complete=persisted.get("training_complete", True),
-#             connection_string=persisted.get("connection_string"),
-#             common_filter_keys=persisted.get("common_filter_keys", []),
-#             session_filter_values=persisted.get("session_filter_values", {})
-
-#         )
-#     memory_key = str(body.thread_id) if body.thread_id else body.session_id
-#     memory = get_session_memory(memory_key)
-#     conversation_context = memory.get_context_for_prompt()
-#     max_retries = 3
-#     last_error = ""
-#     final_existence_reason = None
-
-#     question = await corrector.correct(body.question)
-#     logger.info(f"Corrected Text : {question}")
-#     JSON_REMINDER = (
-#         "\n⚠️ MANDATORY: Your response MUST be a single valid JSON object. "
-#         "Do NOT return plain SQL or plain text. "
-#         'Return ONLY: {"sql": "...", "chat_response": "", "response_intent": "data", "reason": "..."}'
-#     )
-#     for attempt in range(max_retries):
-#         try:
-#             # Step 1: Plan
-#             plan = await planner.plan(
-#                 collection_name=ctx.qdrant_collection,
-#                 question=question,
-#                 dialect=ctx.dialect,
-#                 conversation_context=conversation_context,
-#             )
-
-#             if plan.needs_clarification and not plan.relevant_tables:
-#                 return ChatResponse(
-#                     mode="empty",
-#                     text_summary="\n".join(plan.clarification_questions),
-#                 )
-
-#             # Step 2: Generate SQL
-#             gen_result = await generator.generate(plan, conversation_context, ctx.qdrant_collection)
-#             logger.debug(f"Generated SQL for question: {gen_result}...")
-#             if gen_result.chat_response and not gen_result.sql:
-#                 logger.info(f"Chat intent detected, skipping SQL pipeline: {gen_result.explanation}")
-#                 return ChatResponse(
-#                     mode="chat",
-#                     text_summary=gen_result.chat_response,
-#                     explanation=gen_result.explanation,
-#                     sql_used="",
-#                     page=1,
-#                     pages_total=1,
-#                 )
-
-#             # Step 3: Validate SQL
-#             val_result = validator.validate(gen_result.sql, ctx.dialect)
-#             if not val_result.is_valid:
-#                 last_error = "; ".join(val_result.errors)
-#                 logger.warning(f"Validation failed (attempt {attempt+1}): {last_error}")
-#                 # Feed error back as context for retry
-#                 conversation_context = (
-#                     f"{conversation_context}\n"
-#                     f"[PREVIOUS ATTEMPT FAILED: {last_error}. Fix and try again.]"
-#                     f"{JSON_REMINDER}"
-#                 )
-#                 continue
-
-#             safe_sql = val_result.sql
-#             logger.debug(f"Executing validated SQL (length: {len(safe_sql)} chars)")
-#             engine = connector.from_connection_string(ctx.connection_string)
-#             # Step 4: Execute
-            
-#             result = await executor.execute(engine, safe_sql)
-#             is_zero_result = False
-#             if not result.error:
-#                 if not result.rows:
-#                     is_zero_result = True
-#                 elif len(result.rows) == 1:
-#                     vals = list(result.rows[0].values())
-#                     if vals and all(v in {0, 0.0, '0', None} for v in vals):
-#                         is_zero_result = True
-
-#             if is_zero_result:
-#                 zero_rows_on_last_attempt = True
-#                 entity_exists = None
-#                 try:
-#                     from app.query.existence_checker import ExistenceChecker
-#                     checker = ExistenceChecker()
-#                     existence_info = await checker.check_existence_sql(safe_sql, question, ctx.dialect)
-                    
-#                     if existence_info.existence_sql:
-#                         engine = connector.from_connection_string(ctx.connection_string)
-#                         ex_result = await executor.execute(engine, existence_info.existence_sql)
-#                         if not ex_result.rows and not ex_result.error:
-#                             entity_exists = False
-#                             final_existence_reason = f"The core entity ({existence_info.entity_name}) does not exist in the database at all."
-#                         elif not ex_result.error:
-#                             entity_exists = True
-#                             final_existence_reason = None
-#                 except Exception as e:
-#                     logger.warning(f"Existence check flow failed silently: {e}")
-                
-#                 if attempt < max_retries - 1:
-#                     logger.warning(f"Zero rows returned (attempt {attempt+1}), retrying with smart existence feedback...")
-#                     if entity_exists is False:
-#                         smart_feedback = (
-#                             f"Furthermore, the entity '{existence_info.entity_name}' DOES NOT EXIST in the filtered table/column! "
-#                             f"You must check another table, or check different column names."
-#                         )
-#                     elif entity_exists is True:
-#                         smart_feedback = (
-#                             f"The entity '{existence_info.entity_name}' DOES EXIST, but the entire query returned 0 rows. "
-#                             f"Check your JOIN conditions or other filters to see why records were excluded."
-#                         )
-#                     else:
-#                         smart_feedback = (
-#                             f"Check another table, check column names, or use broader LIKE patterns."
-#                         )
-
-#                     conversation_context = (
-#                         f"{conversation_context}\n"
-#                         f"[PREVIOUS SQL RETURNED 0 ROWS: {safe_sql}\n"
-#                         f"The query executed successfully but found no data. "
-#                         f"{smart_feedback}]"
-#                         f"{JSON_REMINDER}"
-#                     )
-#                     continue
-#                 else:
-#                     logger.info(f"Query returned 0 rows on final attempt. Breaking loop.")
-#                     break
-            
-#             if result.error:
-#                 last_error = result.error
-
-#                 logger.warning(f"Execution failed (attempt {attempt+1}): {last_error}")
-#                 conversation_context = (
-#                     f"{conversation_context}\n"
-#                     f"[SQL EXECUTION ERROR: {last_error}. Rewrite the SQL.]"
-#                     f"Check if the given column exists in the table."
-#                     f"{JSON_REMINDER}"
-#                 )
-#                 continue
-#             zero_rows_on_last_attempt = False
-#             # Step 5: Format
-#             formatted = await formatter.format(
-#                 question=question,
-#                 rows=result.rows,
-#                 columns=result.columns,
-#                 sql=safe_sql,
-#                 explanation=gen_result.explanation,
-#                 page=body.page,
-#                 response_intent=gen_result.response_intent
-#             )
-
-#             # Step 6: Store in conversation memory
-#             memory.add_turn(ConversationTurn(
-#                 question=question,
-#                 sql_generated=safe_sql,
-#                 result_summary=(
-#                     f"{result.row_count} rows, columns: {', '.join(result.columns[:5])}"
-#                 ),
-#                 # ✅ Add this — store up to 3 rows so follow-ups can reference actual data
-#                 result_sample=result.rows[:3],
-#                 services_used=[ctx.db_name],
-#                 filters_applied=[],
-#             ))
-
-#             # Save to Db if thread_id is present
-#             if body.thread_id:
-#                 db_session = AppDBSession()
-#                 try:
-#                     u_msg = ChatThreadMessage(
-#                         thread_id=body.thread_id,
-#                         role="user",
-#                         content=question
-#                     )
-#                     db_session.add(u_msg)
-#                     a_msg = ChatThreadMessage(
-#                         thread_id=body.thread_id,
-#                         role="assistant",
-#                         content=formatted.text_summary,
-#                         sql_used=safe_sql,
-#                         table_data=formatted.table_data,
-#                         columns=formatted.columns,
-#                         stats=formatted.stats,
-#                         visualization_hint=formatted.visualization_hint,
-#                         chart_x_axis=formatted.chart_x_axis,
-#                         chart_y_axis=formatted.chart_y_axis,
-#                         explanation=formatted.explanation
-#                     )
-#                     db_session.add(a_msg)
-#                     db_session.commit()
-#                 except Exception as e:
-#                     logger.error(f"Failed to save messages to DB: {e}", exc_info=True)
-#                 finally:
-#                     db_session.close()
-
-#             return ChatResponse(
-#                 mode=formatted.mode,
-#                 text_summary=formatted.text_summary,
-#                 table_data=formatted.table_data,
-#                 columns=formatted.columns,
-#                 total_rows=formatted.total_rows,
-#                 stats=formatted.stats,
-#                 visualization_hint=formatted.visualization_hint,
-#                 chart_x_axis=formatted.chart_x_axis,
-#                 chart_y_axis=formatted.chart_y_axis,
-#                 sql_used=formatted.sql_used,
-#                 explanation=formatted.explanation,
-#                 page=formatted.page,
-#                 pages_total=formatted.pages_total,
-#             )
-
-#         except Exception as e:
-#             last_error = str(e)
-#             logger.error(f"Query pipeline error (attempt {attempt+1}): {e}", exc_info=True)
-#             conversation_context = (
-#                 f"{conversation_context}\n"
-#                 f"[ERROR: {last_error}. Try a different approach.]"
-#                 f"{JSON_REMINDER}"
-#             )
-
-#     if zero_rows_on_last_attempt:
-#         no_data_text = await formatter._humanize_no_data(question, final_existence_reason)
-#         return ChatResponse(
-#             mode="empty",
-#             text_summary=no_data_text,
-#             sql_used=safe_sql,
-#             page=1,
-#             pages_total=1,
-#         )
-    
-#     error_text = await formatter._humanize_error(question)
-#     return ChatResponse(
-#         mode="empty",
-#         text_summary=error_text,
-#     )
-
-@app.post("/api/chat/query", response_model=ChatResponse)
-@limiter.limit("20/minute")
-async def chat_query(request: Request, body: ChatRequest):
-    """Run the full NL → SQL → format pipeline."""
-    ctx = await get_session_store().get(body.session_id)
-    if not ctx:
-        persisted = load_session(body.session_id)
-        if not persisted:
-            raise HTTPException(status_code=404, detail="Session not found or expired.")
-        
-        # Rebuild a minimal SessionContext (engine cannot be recovered for upload)
-        ctx = SessionContext(
-            session_id=persisted["session_id"],
-            engine=None,  # Engine is gone, cannot run queries, but schema/Qdrant works
-            dialect=persisted["dialect"],
-            db_name=persisted["db_name"],
-            source_type="unknown",
-            table_count=0,
-            qdrant_collection=persisted["qdrant_collection"],
-            db_key=persisted["db_key"],
-            training_complete=persisted.get("training_complete", True),
-            connection_string=persisted.get("connection_string"),
-            common_filter_keys=persisted.get("common_filter_keys", []),
-            session_filter_values=persisted.get("session_filter_values", {}),
-            is_owner=persisted.get("is_owner", False)
-
-        )
-    # if not ctx.training_complete:
-    #     raise HTTPException(status_code=409, detail="Database training not complete. Please wait.")
-
-    memory = get_session_memory(body.session_id)
-    conversation_context = memory.get_context_for_prompt()
-    last_error = ""
-    zero_rows_on_last_attempt = False
-    max_retries = 3
-    last_error = ""
-    JSON_REMINDER = (
-        "\n⚠️ MANDATORY: Your response MUST be a single valid JSON object. "
-        "Do NOT return plain SQL or plain text. "
-        'Return ONLY: {"sql": "...", "chat_response": "", "response_intent": "data", "reason": "..."}'
-    )
-    question = await corrector.correct(body.question)
-    logger.info(f"Corrected Text : {question}")
-    if not ctx.connection_string:
-        raise HTTPException(
-            status_code=400,
-            detail="This session was restored from an upload and cannot run new queries. Please re-upload your file."
-        )
-    engine = connector.from_connection_string(ctx.connection_string)
-    for attempt in range(max_retries):
-        try:
-            # Step 1: Plan
-            plan = await planner.plan(
-                collection_name=ctx.qdrant_collection,
-                question=question,
-                dialect=ctx.dialect,
-                conversation_context=conversation_context,
-            )
-
-            if plan.needs_clarification and not plan.relevant_tables:
-                return ChatResponse(
-                    mode="empty",
-                    text_summary="\n".join(plan.clarification_questions),
-                )
-
-            # Step 2: Generate SQL
-            gen_result = await generator.generate(plan, conversation_context, ctx.qdrant_collection)
-            logger.debug(f"Generated SQL for question: {gen_result}...")
-            if gen_result.chat_response and not gen_result.sql:
-                logger.info(f"Chat intent detected, skipping SQL pipeline: {gen_result.explanation}")
-                return ChatResponse(
-                    mode="chat",
-                    text_summary=gen_result.chat_response,
-                    explanation=gen_result.explanation,
-                    sql_used="",
-                    page=1,
-                    pages_total=1,
-                )
-
-            # Step 3: Validate SQL
-            val_result = validator.validate(gen_result.sql, ctx.dialect)
-            if not val_result.is_valid:
-                last_error = "; ".join(val_result.errors)
-                logger.warning(f"Validation failed (attempt {attempt+1}): {last_error}")
-                # Feed error back as context for retry
-                conversation_context = (
-                    f"{conversation_context}\n"
-                    f"[PREVIOUS ATTEMPT FAILED: {last_error}. Fix and try again.]"
-                )
-                continue
-
-            safe_sql = val_result.sql
-            
-            # Apply mandatory filters if present (skipped for owners)
-            logger.info(f"Chat session: {body.session_id} (is_owner: {getattr(ctx, 'is_owner', False)})")
-            if not getattr(ctx, 'is_owner', False) and getattr(ctx, 'common_filter_keys', None):
-                logger.info(f"Filter Values (Keys): {ctx.common_filter_keys}")
-                logger.info(f"Filter Values (Values): {getattr(ctx, 'session_filter_values', {})}")
-                try:
-                    from app.query.filter_verifier import SQLFilterVerifier
-                    verifier = SQLFilterVerifier(dialect=ctx.dialect)
-                    table_schemas = await _get_table_schemas(ctx)
-                    logger.info(f"Filter Values {ctx.common_filter_keys}")
-                    safe_sql = verifier.verify_and_inject(
-                        sql=safe_sql,
-                        filter_keys=ctx.common_filter_keys,
-                        filter_values=getattr(ctx, 'session_filter_values', {}),
-                        table_schemas=table_schemas
-                    )
-                    logger.info(f"Filtered SQL applied: {safe_sql}")
-                except PermissionError as e:
-                    permission_error_text = await formatter._humanize_permission_error(question)
-                    return ChatResponse(
-                        mode="empty",
-                        text_summary=permission_error_text,
-                        sql_used=val_result.sql,
-                    )
-                except Exception as e:
-                    logger.error(f"Filter injection failed: {e}", exc_info=True)
-                    return ChatResponse(
-                        mode="empty",
-                        text_summary="Security verification failed. Please try a different query.",
-                    )
-
-            logger.debug(f"Executing validated SQL (length: {len(safe_sql)} chars)")
-            
-            # Step 4: Execute
-            
-            result = await executor.execute(engine, safe_sql)
-            if not result.rows and not result.error:
-                zero_rows_on_last_attempt = True
-                last_error = "Query returned 0 rows"
-                logger.warning(f"Zero rows returned (attempt {attempt+1}), retrying with feedback...")
-                conversation_context = (
-                    f"{conversation_context}\n"
-                    f"[PREVIOUS SQL RETURNED 0 ROWS: {safe_sql}\n"
-                    f"The query executed successfully but found no data. "
-                    f"Try relaxing filters, removing WHERE conditions, "
-                    f"checking column names, or using broader LIKE patterns.]"
-                    f"{JSON_REMINDER}"
-                )
-                continue
-            
-            if result.error:
-                last_error = result.error
-
-                logger.warning(f"Execution failed (attempt {attempt+1}): {last_error}")
-                conversation_context = (
-                    f"{conversation_context}\n"
-                    f"[SQL EXECUTION ERROR: {last_error}. Rewrite the SQL.]"
-                    f"Check if the given column exists in the table."
-                    f"{JSON_REMINDER}"
-                )
-                continue
-            zero_rows_on_last_attempt = False
-            # Step 5: Format
-            formatted = await formatter.format(
-                question=question,
-                rows=result.rows,
-                columns=result.columns,
-                sql=safe_sql,
-                explanation=gen_result.explanation,
-                page=body.page,
-            )
-
-            # Step 6: Store in conversation memory
-            memory.add_turn(ConversationTurn(
-                question=question,
-                sql_generated=safe_sql,
-                result_summary=(
-                    f"{result.row_count} rows, columns: {', '.join(result.columns[:5])}"
-                ),
-                # ✅ Add this — store up to 3 rows so follow-ups can reference actual data
-                result_sample=result.rows[:3],
-                services_used=[ctx.db_name],
-                filters_applied=[],
-            ))
-            save_session_memory(body.session_id)
-
-
-            return ChatResponse(
-                mode=formatted.mode,
-                text_summary=formatted.text_summary,
-                table_data=formatted.table_data,
-                columns=formatted.columns,
-                total_rows=formatted.total_rows,
-                stats=formatted.stats,
-                visualization_hint=formatted.visualization_hint,
-                chart_x_axis=formatted.chart_x_axis,
-                chart_y_axis=formatted.chart_y_axis,
-                sql_used=formatted.sql_used,
-                explanation=formatted.explanation,
-                page=formatted.page,
-                pages_total=formatted.pages_total,
-            )
-
-        except Exception as e:
-            last_error = str(e)
-            logger.error(f"Query pipeline error (attempt {attempt+1}): {e}", exc_info=True)
-            conversation_context = (
-                f"{conversation_context}\n"
-                f"[ERROR: {last_error}. Try a different approach.]"
-                f"{JSON_REMINDER}"
-            )
-    if zero_rows_on_last_attempt:
-        no_data_text = await formatter._humanize_no_data(question)
-        return ChatResponse(
-            mode="no_data",
-            text_summary=no_data_text,
-            sql_used="",
-            page=1,
-            pages_total=1,
-        )
-
-    return ChatResponse(
-        mode="empty",
-        text_summary=(
-            f"I wasn't able to answer your question after {max_retries} attempts. "
-            f"Last error: {last_error}. "
-            f"Please try rephrasing your question."
-        ),
-    )
-
-
-@app.delete("/api/session/{session_id}")
-async def disconnect(session_id: str):
-    """Disconnect a session — cleans up Qdrant collection and uploaded files."""
-    ctx = await get_session_store().evict(session_id)
-    if ctx:
-        from app.training.indexer import Indexer
-        indexer = Indexer()
-        await indexer.delete_collection(session_id)
-        if ctx.source_type == "upload":
-            connector.cleanup_session(session_id)
-        delete_session_memory(session_id)
-        return {"message": f"Session {session_id} disconnected and cleaned up."}
-    return {"message": "Session not found (may have already expired)."}
-
-class CreateThreadRequest(BaseModel):
-    db_session_id: str
-    title: str
-
-@app.get("/api/chat/threads")
-def get_chat_threads(user: User = Depends(get_current_user)):
-    db = AppDBSession()
-    try:
-        threads = db.query(ChatThread).filter(ChatThread.user_id == user.id).order_by(ChatThread.created_at.desc()).all()
-        return [{"id": t.id, "title": t.title, "created_at": t.created_at, "db_session_id": t.db_session_id} for t in threads]
-    finally:
-        db.close()
-
-@app.post("/api/chat/threads")
-def create_chat_thread(req: CreateThreadRequest, user: User = Depends(get_current_user)):
-    db = AppDBSession()
-    try:
-        t = ChatThread(user_id=user.id, db_session_id=req.db_session_id, title=req.title)
-        db.add(t)
-        db.commit()
-        db.refresh(t)
-        return {"id": t.id, "title": t.title, "db_session_id": t.db_session_id, "created_at": t.created_at.isoformat() if t.created_at else None}
-    finally:
-        db.close()
-
-@app.get("/api/chat/threads/{thread_id}/messages")
-def get_thread_messages(thread_id: int, user: User = Depends(get_current_user)):
-    db = AppDBSession()
-    try:
-        t = db.query(ChatThread).filter(ChatThread.id == thread_id, ChatThread.user_id == user.id).first()
-        if not t:
-            raise HTTPException(404, "Thread not found")
-        messages = db.query(ChatThreadMessage).filter(ChatThreadMessage.thread_id == thread_id).order_by(ChatThreadMessage.id.asc()).all()
-        return [
-            {
-                "id": m.id,
-                "role": m.role,
-                "content": m.content,
-                "sql_used": m.sql_used,
-                "table_data": m.table_data,
-                "columns": m.columns,
-                "stats": m.stats,
-                "visualization_hint": m.visualization_hint,
-                "chart_x_axis": m.chart_x_axis,
-                "chart_y_axis": m.chart_y_axis,
-                "explanation": m.explanation
-            }
-            for m in messages
-        ]
-    finally:
-        db.close()
-
-# ── Helpers ────────────────────────────────────────────────────────────────
-
-def _extract_db_name(conn_str: str) -> str:
-    """Extract database name from connection string for display."""
-    try:
-        parts = conn_str.split("/")
-        name = parts[-1].split("?")[0]
-        return name or "database"
-    except Exception:
-        return "database"
-
-async def _get_table_schemas(ctx: SessionContext) -> Dict[str, Any]:
-    """
-    Fetch full table schema payloads for the session.
-
-    Returns Dict[str, dict] — full payload per table (includes reverse_foreign_keys).
-    The filter verifier supports both full payloads and plain column lists,
-    so this change is backward-compatible.
-    """
-    if ctx.tables:
-        # ctx.tables are TableInfo objects — build a payload-shaped dict manually.
-        # reverse_foreign_keys are NOT on TableInfo, so we compute them here
-        # the same way the indexer does.
-        reverse_fk_map: Dict[str, list] = {}
-        for t in ctx.tables:
-            for fk in t.foreign_keys:
-                target = fk["to_table"].lower()
-                reverse_fk_map.setdefault(target, []).append({
-                    "referencing_table": t.table_name,
-                    "referencing_col":   fk["from"],
-                    "local_col":         fk["to_col"],
-                })
-
-        schemas = {}
-        for t in ctx.tables:
-            schemas[t.table_name.lower()] = {
-                "table_name":           t.table_name,
-                "columns":              [{"name": c.name, "type": c.data_type} for c in t.columns],
-                "foreign_keys":         t.foreign_keys,
-                "reverse_foreign_keys": reverse_fk_map.get(t.table_name.lower(), []),
-                "row_count":            t.row_count,
-            }
-        return schemas
-
-    # Fallback: load from Qdrant (session restored from saved model, no ctx.tables)
-    from app.training.indexer import Indexer
-    indexer = Indexer()
-    try:
-        results = await indexer.search(
-            ctx.qdrant_collection,
-            "list all tables",
-            top_k=200,
-        )
-        schemas = {}
-        for r in results:
-            t_name = r.get("table_name", "").lower()
-            if t_name:
-                # r is already the full Qdrant payload — store it as-is.
-                # reverse_foreign_keys is present because the indexer stores it.
-                schemas[t_name] = r
-        return schemas
-    except Exception as e:
-        logger.error(f"Failed to fetch schemas from Qdrant: {e}")
-        return {}
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  CHRONOPLOT — UserType enum & role-check helpers
-# ═══════════════════════════════════════════════════════════════════════════
 
 class UserType(IntEnum):
     SuperAdmin  = 2
@@ -1744,6 +892,12 @@ async def chronoplot_chat_query(request: Request, body: ChronoChatRequest, _toke
                 )
             )
             save_message(body.thread_id, "assistant", clarification_text)
+            save_user_history(
+                user_detail_id=user_detail_id,        # already in scope from _cp_authorize
+                question=question,
+                ai_response=clarification_text,
+                sql="",
+            )
             return ChronoChatResponse(
                 mode="clarification",
                 text_summary=clarification_text,
@@ -1811,6 +965,12 @@ async def chronoplot_chat_query(request: Request, body: ChronoChatRequest, _toke
                 save_session_memory(memory_key)
  
                 save_message(body.thread_id, "assistant", clarification_text)
+                save_user_history(
+                    user_detail_id=user_detail_id,        # already in scope from _cp_authorize
+                    question=question,
+                    ai_response=clarification_text,
+                    sql="",
+                )
                 return ChronoChatResponse(
                     mode="clarification",
                     text_summary=clarification_text,
@@ -1822,6 +982,12 @@ async def chronoplot_chat_query(request: Request, body: ChronoChatRequest, _toke
             if plan.needs_clarification and not plan.relevant_tables:
                 no_data_text = await formatter._humanize_no_data(question)
                 save_message(body.thread_id, "assistant", no_data_text)
+                save_user_history(
+                    user_detail_id=user_detail_id,        # already in scope from _cp_authorize
+                    question=question,
+                    ai_response=no_data_text,
+                    sql="",
+                )
                 return ChronoChatResponse(mode="empty", text_summary=no_data_text, page=1, pages_total=1)
  
             gen_result = await generator.generate(plan, conversation_context, ctx.qdrant_collection)
@@ -1832,6 +998,12 @@ async def chronoplot_chat_query(request: Request, body: ChronoChatRequest, _toke
                 })
                 save_session_memory(memory_key)
                 save_message(body.thread_id, "assistant", gen_result.chat_response)
+                save_user_history(
+                    user_detail_id=user_detail_id,        # already in scope from _cp_authorize
+                    question=question,
+                    ai_response=gen_result.chat_response,
+                    sql="",
+                )
                 return ChronoChatResponse(
                     mode="clarification",
                     text_summary=gen_result.chat_response,
@@ -1840,6 +1012,12 @@ async def chronoplot_chat_query(request: Request, body: ChronoChatRequest, _toke
                 )
             if gen_result.chat_response and not gen_result.sql:
                 save_message(body.thread_id, "assistant", gen_result.chat_response)
+                save_user_history(
+                    user_detail_id=user_detail_id,        # already in scope from _cp_authorize
+                    question=question,
+                    ai_response=gen_result.chat_response,
+                    sql="",
+                )
                 return ChronoChatResponse(mode="chat", text_summary=gen_result.chat_response, explanation=gen_result.explanation)
  
             val_result = validator.validate(gen_result.sql, ctx.dialect)
@@ -1883,9 +1061,22 @@ async def chronoplot_chat_query(request: Request, body: ChronoChatRequest, _toke
                         )
                         logger.info(f"Filtered SQL applied: {safe_sql}")
                 except PermissionError as exc:
-                    return ChronoChatResponse(mode="empty", text_summary=str(exc), sql_used=val_result.sql)
+                    permission_error_text = await formatter._humanize_permission_error(question)
+                    save_user_history(
+                        user_detail_id=user_detail_id,        # already in scope from _cp_authorize
+                        question=question,
+                        ai_response=permission_error_text,
+                        sql=val_result.sql,
+                    )
+                    return ChronoChatResponse(mode="empty", text_summary=permission_error_text, sql_used=val_result.sql)
                 except Exception as exc:
                     logger.error(f"[chronoplot] Filter injection failed: {exc}", exc_info=True)
+                    save_user_history(
+                        user_detail_id=user_detail_id,        # already in scope from _cp_authorize
+                        question=question,
+                        ai_response="Security verification failed",
+                        sql=val_result.sql,
+                    )
                     return ChronoChatResponse(mode="empty", text_summary="Security verification failed.", sql_used=val_result.sql)
             last_successful_sql = safe_sql
  
@@ -1908,7 +1099,8 @@ async def chronoplot_chat_query(request: Request, body: ChronoChatRequest, _toke
                     f"Error: {last_error}. Rewrite the SQL.]{JSON_REMINDER}"
                 )
                 continue
- 
+            vault_map = mem.pii_vault_map  # reference to mem's dict
+            safe_sample = pii_vault.anonymize_rows(result.rows[:3], vault_map)
             zero_rows_on_last_attempt = False
             formatted = await formatter.format(
                 question=question,
@@ -1917,13 +1109,15 @@ async def chronoplot_chat_query(request: Request, body: ChronoChatRequest, _toke
                 sql=safe_sql,
                 explanation=gen_result.explanation,
                 page=body.page,
+                session_id=memory_key,
+                vault_map=vault_map
             )
  
             mem.add_turn(ConversationTurn(
                 question=question,
                 sql_generated=safe_sql,
                 result_summary=f"{result.row_count} rows, columns: {', '.join(result.columns[:5])}",
-                result_sample=result.rows[:3],
+                result_sample=safe_sample,
                 services_used=[ctx.db_name],
                 filters_applied=[],
             ))
@@ -1943,7 +1137,12 @@ async def chronoplot_chat_query(request: Request, body: ChronoChatRequest, _toke
                     chart_y_axis=formatted.chart_y_axis,
                     explanation=formatted.explanation,
                 )
- 
+            save_user_history(
+                user_detail_id=user_detail_id,        # already in scope from _cp_authorize
+                question=question,
+                ai_response=formatted.text_summary,
+                sql=safe_sql,
+            )
             return ChronoChatResponse(
                 mode=formatted.mode, text_summary=formatted.text_summary,
                 table_data=formatted.table_data, columns=formatted.columns,
@@ -1964,6 +1163,12 @@ async def chronoplot_chat_query(request: Request, body: ChronoChatRequest, _toke
     if zero_rows_on_last_attempt:
         no_data_text = await formatter._humanize_no_data(question)
         save_message(body.thread_id, "assistant", no_data_text)
+        save_user_history(
+            user_detail_id=user_detail_id,        # already in scope from _cp_authorize
+            question=question,
+            ai_response=no_data_text,
+            sql=last_successful_sql,
+        )
         return ChronoChatResponse(
             mode="no_data",
             text_summary=no_data_text,
@@ -1972,6 +1177,12 @@ async def chronoplot_chat_query(request: Request, body: ChronoChatRequest, _toke
             pages_total=1,
         )
     no_data_text = await formatter._humanize_no_data(question)
+    save_user_history(
+        user_detail_id=user_detail_id,        # already in scope from _cp_authorize
+        question=question,
+        ai_response=no_data_text,
+        sql=last_successful_sql,
+    )
     return ChronoChatResponse(mode="empty", text_summary=no_data_text, sql_used=last_successful_sql) 
 
 @app.get("/api/chronoplot/chat/threads")
